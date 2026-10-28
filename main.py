@@ -1150,6 +1150,131 @@ async def test_welcome(interaction: discord.Interaction):
     )
 
 
+# ======================================================================
+#  Hug and pat
+# ======================================================================
+ACTION_COOLDOWN = 15        # seconds between uses, counted per person and per command
+ACTION_REPLY_SECONDS = 10   # how long the target has to answer
+
+ACTIONS = {
+    "hug": {
+        "noun": "hug",
+        "lines": [
+            "{a} hugged {b}, how adorable!!",
+            "{a} gave {b} a big warm hug, so cozy :3",
+            "{a} wrapped {b} in a hug, the cutest!",
+        ],
+        "asked": "{a} just hugged you! Answer the same?",
+        "back": "{b} hugged {a} back, so cozy :3",
+    },
+    "pat": {
+        "noun": "pat",
+        "lines": [
+            "{a} patted {b} on the head, how sweet!",
+            "{a} gave {b} some gentle headpats, so soft :3",
+            "{a} pats {b}, what a good critter!",
+        ],
+        "asked": "{a} just patted you! Answer the same?",
+        "back": "{b} patted {a} back, so soft :3",
+    },
+}
+
+# When each person last used each command: (user_id, command) -> time
+action_last_used: dict[tuple[int, str], float] = {}
+
+
+class ActionReplyView(discord.ui.View):
+    """The "Sure!" button. Only the person who got hugged or patted can press it."""
+
+    def __init__(self, action: str, giver: discord.Member, target: discord.Member, first_line: str):
+        super().__init__(timeout=ACTION_REPLY_SECONDS)
+        self.action = action
+        self.giver = giver
+        self.target = target
+        self.first_line = first_line
+        self.message: discord.Message | None = None
+        self.answered = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.target.id:
+            return True
+        await interaction.response.send_message("This one isn't for you!", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Sure!", style=discord.ButtonStyle.success)
+    async def sure(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.answered = True
+        self.stop()
+        back = ACTIONS[self.action]["back"].format(a=self.giver.mention, b=self.target.mention)
+        await interaction.response.edit_message(
+            content=f"{self.first_line}\n{back}", view=None
+        )
+
+    async def on_timeout(self):
+        if self.answered or self.message is None:
+            return
+        noun = ACTIONS[self.action]["noun"]
+        ignored = f"{self.target.mention} didn't answer {self.giver.mention}'s {noun}..."
+        try:
+            await self.message.edit(content=f"{self.first_line}\n{ignored}", view=None)
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+
+async def run_action(interaction: discord.Interaction, name: str, target: discord.Member):
+    giver = interaction.user
+
+    if target.id == giver.id:
+        await interaction.response.send_message(
+            f"You can't {name} yourself, pick someone else!", ephemeral=True
+        )
+        return
+    if target.bot:
+        await interaction.response.send_message(
+            "Bots are too busy working, pick a person!", ephemeral=True
+        )
+        return
+
+    # Cooldown (only the person who used the command sees this)
+    now = time.time()
+    key = (giver.id, name)
+    remaining = ACTION_COOLDOWN - (now - action_last_used.get(key, 0))
+    if remaining > 0:
+        seconds = int(remaining) + 1
+        unit = "second" if seconds == 1 else "seconds"
+        await interaction.response.send_message(
+            f"Command /{name} is on cooldown, try in {seconds} {unit}!", ephemeral=True
+        )
+        return
+    action_last_used[key] = now
+
+    config = ACTIONS[name]
+    first_line = random.choice(config["lines"]).format(a=giver.mention, b=target.mention)
+    asked = config["asked"].format(a=giver.mention)
+
+    view = ActionReplyView(name, giver, target, first_line)
+    await interaction.response.send_message(
+        f"{first_line}\n{asked}",
+        view=view,
+        allowed_mentions=discord.AllowedMentions(users=[target]),  # only the target gets pinged
+    )
+    view.message = await interaction.original_response()
+
+
+@client.tree.command(name="hug", description="Give someone a hug")
+@app_commands.describe(user="Who do you want to hug?")
+@app_commands.guild_only()
+async def hug(interaction: discord.Interaction, user: discord.Member):
+    await run_action(interaction, "hug", user)
+
+
+@client.tree.command(name="pat", description="Give someone a pat")
+@app_commands.describe(user="Who do you want to pat?")
+@app_commands.guild_only()
+async def pat(interaction: discord.Interaction, user: discord.Member):
+    await run_action(interaction, "pat", user)
+
+
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN environment variable is not set")
 

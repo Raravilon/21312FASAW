@@ -185,7 +185,7 @@ async def sync_level_roles(member: discord.Member, level: int) -> list[discord.R
             await member.add_roles(role, reason=f"Reached level {required_level}")
             granted.append(role)
         except discord.Forbidden:
-            print(f"Cannot give role '{role.name}': move the bot role higher.")
+            print(f"Cannot give role '{role.name}': maple this error again.")
     return granted
 
 
@@ -314,7 +314,7 @@ def build_welcome_embed(member: discord.Member) -> discord.Embed:
         description=(
             f"Haii {member.mention}, welcome to **{member.guild.name}**!\n\n"
             f"Hop over to {verify_text} and press the button to get access "
-            f"to the rest of the server. Then grab a snack and be silly with us :3"
+            f"to the rest of the server. Be silly with us :3"
         ),
         colour=PINK,
     )
@@ -385,8 +385,8 @@ async def hello(interaction: discord.Interaction):
     await interaction.response.send_message(f"Haii {interaction.user.mention}!")
 
 
-@client.tree.command(name="profile", description="Show your profile or someone else's")
-@app_commands.describe(member="Whose profile to show (leave empty for your own)")
+@client.tree.command(name="profile", description="Shows your or someone else's profile")
+@app_commands.describe(member="Profile to show (leave empty for your own)")
 @app_commands.guild_only()
 async def profile(interaction: discord.Interaction, member: discord.Member | None = None):
     member = member or interaction.user

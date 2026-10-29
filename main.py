@@ -1166,6 +1166,16 @@ class ShopView(discord.ui.View):
         self.notice: str | None = None
         self.build()
 
+    # Защита: только тот, кто вызвал /shop, может нажимать на кнопки в этом меню
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.member.id:
+            return True
+        await interaction.response.send_message(
+            "Это не твой магазин! Напиши /shop, чтобы открыть свой.", 
+            ephemeral=True
+        )
+        return False
+
     def items(self) -> list[dict]:
         if self.category is None:
             return []
@@ -1215,7 +1225,8 @@ class ShopView(discord.ui.View):
 @app_commands.guild_only()
 async def shop(interaction: discord.Interaction):
     view = ShopView(interaction.user)
-    await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
+    # Магазин теперь не ephemeral, его видят все (ephemeral=True убрано)
+    await interaction.response.send_message(embed=view.make_embed(), view=view)
 
 # ----- Admin setup commands (run them inside the right channel) -----
 @client.tree.command(name="setup_verify", description="Post the verification message (admins only)")
@@ -1291,7 +1302,6 @@ async def test_welcome(interaction: discord.Interaction):
 ACTION_COOLDOWN = 15        
 ACTION_REPLY_SECONDS = 10   
 
-# Добавлены .gif на конце ссылок, чтобы картинка прогружалась как Embed 
 PAT_GIFS: list[str] = [
     "https://klipy.com/gifs/pats-pat-on-head.gif",
     "https://klipy.com/gifs/furry-headpat.gif",
@@ -1365,7 +1375,8 @@ class ActionReplyView(discord.ui.View):
         self.answered = True
         self.stop()
         back = ACTIONS[self.action]["back"].format(a=self.giver.mention, b=self.target.mention)
-        embed = build_action_embed(f"{self.first_line}\n{back}", pick_gif(self.action))
+        # Оставляем ТУ ЖЕ САМУЮ гифку, что была с самого начала (без смены)
+        embed = build_action_embed(f"{self.first_line}\n{back}", self.image_url)
         await interaction.response.edit_message(embed=embed, view=None)
 
     async def on_timeout(self):
@@ -1408,6 +1419,8 @@ async def run_action(interaction: discord.Interaction, name: str, target: discor
     config = ACTIONS[name]
     first_line = random.choice(config["lines"]).format(a=giver.mention, b=target.mention)
     asked = config["asked"].format(a=giver.mention)
+    
+    # Гифка берется СРАЗУ и прикрепляется к самому первому сообщению
     image_url = pick_gif(name)
 
     view = ActionReplyView(name, giver, target, first_line, image_url)

@@ -28,18 +28,21 @@ LEVEL_ROLES = [
     (15, "PAWSOME"),
 ]
 
-XP_MIN = 15
-XP_MAX = 25
-XP_COOLDOWN = 60  
+# СДЕЛАЛ ОПЫТ ЛЕГЧЕ:
+XP_MIN = 25         # Раньше 15
+XP_MAX = 40         # Раньше 25
+XP_COOLDOWN = 20    # Раньше 60 секунд
 
-MIN_LETTERS = 4            
-MIN_UNIQUE_LETTERS = 3     
+# СДЕЛАЛ АНТИ-СПАМ МЯГЧЕ:
+MIN_LETTERS = 2            # Раньше 4
+MIN_UNIQUE_LETTERS = 2     # Раньше 3
 SPAM_HISTORY = 5           
 SIMILARITY_LIMIT = 0.85    
 
-MESSAGES_PER_MUPS = 100   
-MUPS_REWARD = 10          
-VOICE_SECONDS_PER_VUPS = 3600  
+# СДЕЛАЛ ФАРМ ВАЛЮТЫ БЫСТРЕЕ:
+MESSAGES_PER_MUPS = 25     # Раньше 100
+MUPS_REWARD = 15           # Раньше 10
+VOICE_SECONDS_PER_VUPS = 1800  # Раньше 3600 (1 час), теперь 30 минут
 VUPS_REWARD = 1                
 
 VOICE_MAX_LIMIT = 10
@@ -89,6 +92,8 @@ CREAM = discord.Colour.from_str("#f7e7d3")
 
 intents = discord.Intents.default()
 intents.members = True
+# ИСПРАВЛЕНИЕ ОШИБКИ С ОПЫТОМ (Бот теперь видит текст сообщений):
+intents.message_content = True
 
 
 # ======================================================================
@@ -465,8 +470,6 @@ class RolesPanelView(discord.ui.View):
             self.add_item(RoleGroupSelect(member, group, placeholder, multiple, row))
 
 
-# --- Изменение профиля (только свои цвета, местоимения, КУПЛЕННЫЕ эмодзи и имя) ---
-
 class EmojiSelect(discord.ui.Select):
     def __init__(self, member: discord.Member, guild: discord.Guild):
         self.all_emoji_roles = []
@@ -483,7 +486,6 @@ class EmojiSelect(discord.ui.Select):
             options = [discord.SelectOption(label="You don't own any name emojis", value="None")]
             super().__init__(placeholder="Edit your Name emoji!", options=options, disabled=True, row=2)
         else:
-            # Убираем дефолт с None, если что-то уже выбрано
             has_any = any(opt.default for opt in options if opt.value != "None")
             options[0].default = not has_any
             super().__init__(placeholder="Edit your Name emoji!", min_values=1, max_values=1, options=options, row=2)
@@ -553,7 +555,6 @@ class EditProfilePanel(discord.ui.View):
         super().__init__(timeout=600)
         guild = member.guild
         
-        # 1. Colors
         color_group = {"None": None}
         for label, lookup in COLOR_ROLES:
             names = lookup if isinstance(lookup, (tuple, list)) else (lookup,)
@@ -562,7 +563,6 @@ class EditProfilePanel(discord.ui.View):
         if len(color_group) > 1:
             self.add_item(RoleGroupSelect(member, color_group, "Edit your Name color!", False, 0))
 
-        # 2. Pronouns
         pronoun_group = {"None": None}
         for label, lookup in PRONOUN_ROLES:
             names = lookup if isinstance(lookup, (tuple, list)) else (lookup,)
@@ -571,10 +571,7 @@ class EditProfilePanel(discord.ui.View):
         if len(pronoun_group) > 1:
             self.add_item(RoleGroupSelect(member, pronoun_group, "Edit your pronouns!", True, 1))
             
-        # 3. Name Emojis (Only owned)
         self.add_item(EmojiSelect(member, guild))
-        
-        # 4. Change Name
         self.add_item(EditNameButton())
 
 class ProfileView(discord.ui.View):
@@ -981,7 +978,6 @@ async def profile(interaction: discord.Interaction, member: discord.Member | Non
     embed.add_field(name="Next reward", value=next_reward, inline=False)
     embed.set_footer(text=f"Total XP: {data['xp']:,}")
 
-    # Если мы смотрим СВОЙ профиль, добавляем кнопку Edit
     if target_member.id == interaction.user.id:
         view = ProfileView(target_member)
         await interaction.response.send_message(embed=embed, view=view)
@@ -1161,7 +1157,7 @@ class ShopView(discord.ui.View):
         data = db.get(guild.id, self.member.id)
         if self.category is None:
             embed = discord.Embed(title="Silly Shop", description="Welcome in! Pick a category below to see what's on the shelves.", colour=CREAM)
-            embed.set_footer(text=f"{MUPS_REWARD} Mups for every {MESSAGES_PER_MUPS} messages that earn XP, {VUPS_REWARD} Vups for every hour in voice")
+            embed.set_footer(text=f"{MUPS_REWARD} Mups for every {MESSAGES_PER_MUPS} messages that earn XP, {VUPS_REWARD} Vups for every 30 minutes in voice")
         else:
             category = SHOP_CATEGORIES[self.category]
             if category["items"]: body = "\n\n".join(shop_item_text(guild, item) for item in category["items"])
@@ -1191,7 +1187,6 @@ async def shop(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
 async def give_currency(interaction: discord.Interaction, user: discord.Member, amount: int, currency: app_commands.Choice[str]):
-    # Дополнительная проверка: только Создатель или Админы могут использовать эту команду
     if interaction.user.id != interaction.guild.owner_id and not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Only the server creator or admins can do this.", ephemeral=True)
         return
@@ -1253,7 +1248,6 @@ async def test_welcome(interaction: discord.Interaction):
 ACTION_COOLDOWN = 15        
 ACTION_REPLY_SECONDS = 10   
 
-# Заменены на рабочие ссылки от Tenor!
 PAT_GIFS: list[str] = [
     "https://media1.tenor.com/m/la-8MgilWWAAAAAC/furry-furry-cuddle.gif",
     "https://media1.tenor.com/m/FraPRlGRUSQAAAAC/crystal-the-cavern-spirit.gif",

@@ -3,6 +3,8 @@ import random
 import re
 import sqlite3
 import time
+from collections import deque
+from difflib import SequenceMatcher
 
 import discord
 from discord import app_commands
@@ -11,41 +13,37 @@ from discord.ext import tasks
 # ======================================================================
 #  Settings
 # ======================================================================
-# Token comes from the DISCORD_TOKEN environment variable (set it in BotHost)
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# IDs taken from your server links (can be overridden with env variables)
 GUILD_ID = int(os.getenv("GUILD_ID", "1564401949019869224"))
 WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", "1564405099004956702"))
 VERIFY_CHANNEL_ID = int(os.getenv("VERIFY_CHANNEL_ID", "1564405761105461379"))
 
-# Verification roles (looked up by name; created automatically if missing)
 JOINED_ROLE_NAME = os.getenv("JOINED_ROLE_NAME", "Just joined!")
 NEWCOMER_ROLE_NAME = os.getenv("NEWCOMER_ROLE_NAME", "Newcomer :3")
 
-# Level rewards: (level, role name). Names are matched case-insensitively and
-# by prefix, so "Friendly" also finds a role called "Friendly ^~^".
 LEVEL_ROLES = [
     (3, "Silly Critter"),
     (10, "Friendly"),
     (15, "PAWSOME"),
 ]
 
-# XP settings
 XP_MIN = 15
 XP_MAX = 25
-XP_COOLDOWN = 60  # seconds between XP gains per person (messages are still counted)
+XP_COOLDOWN = 60  
 
-# Currencies
-MESSAGES_PER_MUPS = 100   # every 100 messages that earn XP ...
-MUPS_REWARD = 10          # ... gives 10 Mups
-VOICE_SECONDS_PER_VUPS = 3600  # every hour in voice ...
-VUPS_REWARD = 1                # ... gives 1 Vups
+MIN_LETTERS = 4            
+MIN_UNIQUE_LETTERS = 3     
+SPAM_HISTORY = 5           
+SIMILARITY_LIMIT = 0.85    
 
-# Private voice chats
+MESSAGES_PER_MUPS = 100   
+MUPS_REWARD = 10          
+VOICE_SECONDS_PER_VUPS = 3600  
+VUPS_REWARD = 1                
+
 VOICE_MAX_LIMIT = 10
-VOICE_IDLE_SECONDS = 6 * 60 * 60  # delete empty private voices after 6 hours
-# Words that are not allowed in private voice names (short words must be a whole word)
+VOICE_IDLE_SECONDS = 6 * 60 * 60  
 BLOCKED_WORDS: list[str] = [
     "Nigger",
     "Niger",
@@ -56,7 +54,6 @@ BLOCKED_WORDS: list[str] = [
     "roleplay",
 ]
 
-# Self-assign roles: (label shown in the menu, role name or start of it)
 PRONOUN_ROLES = [
     ("He/Him", "He/Him"),
     ("She/Her", "She/Her"),
@@ -72,7 +69,7 @@ COLOR_ROLES = [
     ("Red", "Red"),
     ("Blue", "Blue"),
     ("Light Green", "Light Green"),
-    ("Beige", ("Beige", "Biege")),  # also finds a role spelled "Biege"
+    ("Beige", ("Beige", "Biege")),  
     ("Green", "Green"),
     ("Pink", "Pink"),
     ("Orange", "Orange"),
@@ -85,13 +82,11 @@ PING_ROLES = [
     ("Chat.. revive!", "Chat.. REVIVE"),
 ]
 
-# Where the stats are stored
 DB_PATH = os.getenv("DB_PATH", "data/bot.db")
 
 PINK = discord.Colour.from_str("#f4b6c2")
 CREAM = discord.Colour.from_str("#f7e7d3")
 
-# Needs "Server Members Intent" enabled in the Discord Developer Portal
 intents = discord.Intents.default()
 intents.members = True
 
@@ -121,7 +116,6 @@ class Database:
             )
             """
         )
-        # Upgrade old databases that don't have the currency columns yet
         columns = {row[1] for row in self.conn.execute("PRAGMA table_info(users)")}
         for column in ("mups", "vups", "xp_messages"):
             if column not in columns:
@@ -140,19 +134,13 @@ class Database:
         )
         self.conn.commit()
 
-    # ----- users -----
     def _ensure(self, guild_id: int, user_id: int):
         self.conn.execute(
             "INSERT OR IGNORE INTO users (guild_id, user_id) VALUES (?, ?)",
             (guild_id, user_id),
         )
 
-    def add_message(self, guild_id: int, user_id: int, pings: int, xp_gain: int):
-        """Count a message. Returns (old_xp, new_xp, mups_gained).
-
-        Every message is counted in `messages`, but Mups are only earned from
-        messages that gave XP (`xp_messages`), so spamming doesn't farm coins.
-        """
+    def add_message(self, guild_id: int, user_id: int, pings: int, xp_gain: int, counted: bool = True):
         self._ensure(guild_id, user_id)
         old_xp, old_xp_messages = self.conn.execute(
             "SELECT xp, xp_messages FROM users WHERE guild_id = ? AND user_id = ?",
@@ -163,15 +151,14 @@ class Database:
             new_xp_messages // MESSAGES_PER_MUPS - old_xp_messages // MESSAGES_PER_MUPS
         ) * MUPS_REWARD
         self.conn.execute(
-            "UPDATE users SET messages = messages + 1, pings = pings + ?, xp = xp + ?, "
+            "UPDATE users SET messages = messages + ?, pings = pings + ?, xp = xp + ?, "
             "xp_messages = ?, mups = mups + ? WHERE guild_id = ? AND user_id = ?",
-            (pings, xp_gain, new_xp_messages, mups_gain, guild_id, user_id),
+            (1 if counted else 0, pings, xp_gain, new_xp_messages, mups_gain, guild_id, user_id),
         )
         self.conn.commit()
         return old_xp, old_xp + xp_gain, mups_gain
 
     def add_voice(self, guild_id: int, user_id: int, seconds: int):
-        """Add voice time. Returns Vups gained."""
         self._ensure(guild_id, user_id)
         old_seconds = self.conn.execute(
             "SELECT voice_seconds FROM users WHERE guild_id = ? AND user_id = ?",
@@ -213,7 +200,6 @@ class Database:
         ).fetchone()[0]
 
     def top(self, guild_id: int, column: str, limit: int):
-        """Top users. Returns rows of (user_id, xp, messages, voice_seconds)."""
         if column not in ("xp", "messages", "voice_seconds"):
             raise ValueError("bad column")
         return self.conn.execute(
@@ -222,7 +208,24 @@ class Database:
             (guild_id, limit),
         ).fetchall()
 
-    # ----- private voice channels -----
+    def spend(self, guild_id: int, user_id: int, mups: int, vups: int) -> bool:
+        self._ensure(guild_id, user_id)
+        cursor = self.conn.execute(
+            "UPDATE users SET mups = mups - ?, vups = vups - ? "
+            "WHERE guild_id = ? AND user_id = ? AND mups >= ? AND vups >= ?",
+            (mups, vups, guild_id, user_id, mups, vups),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def refund(self, guild_id: int, user_id: int, mups: int, vups: int):
+        self.conn.execute(
+            "UPDATE users SET mups = mups + ?, vups = vups + ? "
+            "WHERE guild_id = ? AND user_id = ?",
+            (mups, vups, guild_id, user_id),
+        )
+        self.conn.commit()
+
     def add_voice_channel(self, guild_id: int, channel_id: int, owner_id: int, now: int):
         self.conn.execute(
             "INSERT OR REPLACE INTO voices (channel_id, guild_id, owner_id, last_active) "
@@ -254,20 +257,15 @@ class Database:
         self.conn.execute("DELETE FROM voices WHERE channel_id = ?", (channel_id,))
         self.conn.commit()
 
-
 db = Database(DB_PATH)
-
 
 # ======================================================================
 #  Level math and formatting
 # ======================================================================
 def xp_needed(level: int) -> int:
-    """XP needed to go from `level` to `level + 1`."""
     return 5 * level * level + 50 * level + 100
 
-
 def level_from_xp(total_xp: int):
-    """Returns (level, xp_into_level, xp_needed_for_next_level)."""
     level = 0
     remaining = total_xp
     while remaining >= xp_needed(level):
@@ -275,11 +273,9 @@ def level_from_xp(total_xp: int):
         level += 1
     return level, remaining, xp_needed(level)
 
-
 def progress_bar(current: int, total: int, length: int = 14) -> str:
     filled = int(length * current / total) if total else 0
     return "█" * filled + "░" * (length - filled)
-
 
 def format_duration(seconds: int) -> str:
     minutes = seconds // 60
@@ -288,14 +284,7 @@ def format_duration(seconds: int) -> str:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
 
-
 def is_blocked_name(name: str) -> bool:
-    """True if the name contains a blocked word.
-
-    Short words (3 letters or less, like "sex" or "18") only count as whole
-    words, so names like "Essex" or "Room 180" are fine. Longer words are
-    also caught inside other words and when letters are separated ("f u c k").
-    """
     lowered = name.lower()
     tokens = re.findall(r"[a-z0-9]+", lowered)
     compact = "".join(tokens)
@@ -307,7 +296,6 @@ def is_blocked_name(name: str) -> bool:
         elif word in lowered or word in compact:
             return True
     return False
-
 
 # ======================================================================
 #  Role helpers
@@ -322,7 +310,6 @@ def find_role(guild: discord.Guild, name: str) -> discord.Role | None:
             return role
     return None
 
-
 async def get_role(guild: discord.Guild, name: str) -> discord.Role | None:
     role = find_role(guild, name)
     if role is None:
@@ -332,9 +319,7 @@ async def get_role(guild: discord.Guild, name: str) -> discord.Role | None:
             return None
     return role
 
-
 async def sync_level_roles(member: discord.Member, level: int) -> list[discord.Role]:
-    """Give every reward role the member has earned. Returns newly given roles."""
     granted = []
     for required_level, role_name in LEVEL_ROLES:
         if level < required_level:
@@ -349,9 +334,7 @@ async def sync_level_roles(member: discord.Member, level: int) -> list[discord.R
             print(f"Cannot give role '{role.name}': move the bot role higher.")
     return granted
 
-
 def has_level_role(member: discord.Member) -> bool:
-    """True for Silly Critter and above (and for admins)."""
     if member.guild_permissions.administrator:
         return True
     for _, role_name in LEVEL_ROLES:
@@ -360,19 +343,14 @@ def has_level_role(member: discord.Member) -> bool:
             return True
     return False
 
-
 def find_channel_mention(guild: discord.Guild, keyword: str) -> str:
-    """Find a channel whose name contains the keyword (names have decorations)."""
     channel = discord.utils.find(lambda c: keyword in c.name.lower(), guild.channels)
     return channel.mention if channel else f"#{keyword}"
-
 
 # ======================================================================
 #  Verification
 # ======================================================================
 class ConfirmView(discord.ui.View):
-    """Second step: the person confirms they read the rules."""
-
     def __init__(self):
         super().__init__(timeout=300)
 
@@ -401,12 +379,9 @@ class ConfirmView(discord.ui.View):
             view=None,
         )
 
-
 class VerifyView(discord.ui.View):
-    """First step: the button in the verify channel."""
-
     def __init__(self):
-        super().__init__(timeout=None)  # persistent: works after bot restarts
+        super().__init__(timeout=None)
 
     @discord.ui.button(
         label="Verify",
@@ -432,7 +407,6 @@ class VerifyView(discord.ui.View):
             view=ConfirmView(),
             ephemeral=True,
         )
-
 
 # ======================================================================
 #  Private voice chats
@@ -490,10 +464,7 @@ class NameLimitModal(discord.ui.Modal, title="Your voice chat"):
             embed=self.parent.make_embed(), view=self.parent
         )
 
-
 class VoiceSetupView(discord.ui.View):
-    """The settings panel shown after pressing "Create Voice"."""
-
     def __init__(self, owner: discord.Member, category: discord.CategoryChannel | None):
         super().__init__(timeout=600)
         self.owner = owner
@@ -568,7 +539,6 @@ class VoiceSetupView(discord.ui.View):
 
         guild = interaction.guild
 
-        # One voice chat per person
         existing_id = db.get_voice_by_owner(guild.id, self.owner.id)
         if existing_id:
             existing = guild.get_channel(existing_id)
@@ -629,17 +599,13 @@ class VoiceSetupView(discord.ui.View):
             view=None,
         )
 
-        # If they are already in a voice channel, bring them along
         if self.owner.voice is not None:
             try:
                 await self.owner.move_to(channel)
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
-
 class CreateVoiceView(discord.ui.View):
-    """The "Create Voice" button posted in the create-voice channel."""
-
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -670,22 +636,17 @@ class CreateVoiceView(discord.ui.View):
                 return
             db.remove_voice(existing_id)
 
-        # New voices are created in the same category as this channel
         category = getattr(interaction.channel, "category", None)
         view = VoiceSetupView(member, category)
         await interaction.response.send_message(
             embed=view.make_embed(), view=view, ephemeral=True
         )
 
-
 # ======================================================================
 #  Self-assign roles
 # ======================================================================
 class RoleGroupSelect(discord.ui.Select):
-    """One menu for a group of roles (pronouns, colors, pings)."""
-
     def __init__(self, member: discord.Member, group: dict, placeholder: str, multiple: bool, row: int):
-        # group: label -> Role (or None for the "None" option)
         held = set(member.roles)
         has_any = any(role in held for role in group.values() if role)
         options = []
@@ -734,7 +695,6 @@ class RoleGroupSelect(discord.ui.Select):
             content="Saved! You can change this any time.", view=self.view
         )
 
-
 class RolesPanelView(discord.ui.View):
     def __init__(self, member: discord.Member):
         super().__init__(timeout=600)
@@ -757,10 +717,7 @@ class RolesPanelView(discord.ui.View):
                 continue
             self.add_item(RoleGroupSelect(member, group, placeholder, multiple, row))
 
-
 class GetRolesView(discord.ui.View):
-    """The button posted in the get-roles channel."""
-
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -782,7 +739,6 @@ class GetRolesView(discord.ui.View):
             embed=embed, view=RolesPanelView(interaction.user), ephemeral=True
         )
 
-
 # ======================================================================
 #  Bot
 # ======================================================================
@@ -797,7 +753,6 @@ class SillyBot(discord.Client):
         self.add_view(GetRolesView())
         voice_tracker.start()
         voice_cleanup.start()
-        # Sync commands to your server (shows up instantly)
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
@@ -805,38 +760,58 @@ class SillyBot(discord.Client):
     async def on_ready(self):
         print(f"Bot is online as {self.user}")
 
-
 client = SillyBot()
 
-# Remembers when each person last got XP (for the cooldown)
 last_xp_time: dict[tuple[int, int], float] = {}
+recent_messages: dict[tuple[int, int], deque] = {}
 
+URL_RE = re.compile(r"https?://\S+")
+DISCORD_TAG_RE = re.compile(r"<a?:\w+:\d+>|<[@#][!&]?\d+>")  
+
+def letters_only(text: str) -> str:
+    text = URL_RE.sub("", text)
+    text = DISCORD_TAG_RE.sub("", text)
+    return re.sub(r"[\W\d_]+", "", text).lower()
+
+def is_real_message(key: tuple[int, int], content: str) -> bool:
+    letters = letters_only(content)
+    if len(letters) < MIN_LETTERS or len(set(letters)) < MIN_UNIQUE_LETTERS:
+        return False
+    history = recent_messages.setdefault(key, deque(maxlen=SPAM_HISTORY))
+    for old in history:
+        if SequenceMatcher(None, old, letters).ratio() >= SIMILARITY_LIMIT:
+            return False
+    history.append(letters)
+    return True
 
 # ======================================================================
 #  Background tasks
 # ======================================================================
 @tasks.loop(seconds=60)
 async def voice_tracker():
-    """Every minute, add one minute to everyone sitting in a voice channel."""
     guild = client.get_guild(GUILD_ID)
     if guild is None:
         return
     for channel in guild.voice_channels + guild.stage_channels:
         if channel == guild.afk_channel:
             continue
-        for member in channel.members:
-            if not member.bot:
-                db.add_voice(guild.id, member.id, 60)
-
+        humans = [m for m in channel.members if not m.bot]
+        if len(humans) < 2:
+            continue
+        for member in humans:
+            state = member.voice
+            if state is None or state.channel != channel:
+                continue
+            if state.deaf or state.self_deaf:
+                continue
+            db.add_voice(guild.id, member.id, 60)
 
 @voice_tracker.before_loop
 async def before_voice_tracker():
     await client.wait_until_ready()
 
-
 @tasks.loop(minutes=5)
 async def voice_cleanup():
-    """Delete private voice chats that have been empty for too long."""
     guild = client.get_guild(GUILD_ID)
     if guild is None:
         return
@@ -856,11 +831,9 @@ async def voice_cleanup():
                 continue
             db.remove_voice(channel_id)
 
-
 @voice_cleanup.before_loop
 async def before_voice_cleanup():
     await client.wait_until_ready()
-
 
 # ======================================================================
 #  Events
@@ -882,13 +855,11 @@ def build_welcome_embed(member: discord.Member) -> discord.Embed:
     embed.set_footer(text=f"You are member #{member.guild.member_count}")
     return embed
 
-
 @client.event
 async def on_member_join(member: discord.Member):
     if member.guild.id != GUILD_ID or member.bot:
         return
 
-    # Give the "Just joined!" role
     joined_role = await get_role(member.guild, JOINED_ROLE_NAME)
     if joined_role:
         try:
@@ -896,11 +867,9 @@ async def on_member_join(member: discord.Member):
         except discord.Forbidden:
             print("Cannot give the 'Just joined!' role: move the bot role higher.")
 
-    # Welcome message
     channel = member.guild.get_channel(WELCOME_CHANNEL_ID)
     if channel is not None:
         await channel.send(content=member.mention, embed=build_welcome_embed(member))
-
 
 @client.event
 async def on_message(message: discord.Message):
@@ -908,19 +877,17 @@ async def on_message(message: discord.Message):
         return
 
     member = message.author
-
-    # Count pings: unique real people mentioned (not yourself, not bots)
     pings = len({m.id for m in message.mentions if not m.bot and m.id != member.id})
-
-    # XP only if the cooldown has passed
     key = (message.guild.id, member.id)
+    counted = is_real_message(key, message.content)
+
     now = time.time()
     gain = 0
-    if now - last_xp_time.get(key, 0) >= XP_COOLDOWN:
+    if counted and now - last_xp_time.get(key, 0) >= XP_COOLDOWN:
         gain = random.randint(XP_MIN, XP_MAX)
         last_xp_time[key] = now
 
-    old_xp, new_xp, _mups = db.add_message(message.guild.id, member.id, pings, gain)
+    old_xp, new_xp, _mups = db.add_message(message.guild.id, member.id, pings, gain, counted)
 
     old_level = level_from_xp(old_xp)[0]
     new_level = level_from_xp(new_xp)[0]
@@ -932,15 +899,12 @@ async def on_message(message: discord.Message):
             text += f" New role unlocked: {names}"
         await message.channel.send(text)
 
-
 @client.event
 async def on_voice_state_update(member, before, after):
-    """Keep private voice chats alive while people come and go."""
     now = int(time.time())
     for state in (before, after):
         if state.channel is not None:
             db.touch_voice(state.channel.id, now)
-
 
 # ======================================================================
 #  Commands
@@ -950,11 +914,9 @@ async def ping(interaction: discord.Interaction):
     latency = round(client.latency * 1000)
     await interaction.response.send_message(f"Pong! {latency} ms")
 
-
 @client.tree.command(name="hello", description="Say hi to the bot")
 async def hello(interaction: discord.Interaction):
     await interaction.response.send_message(f"Haii {interaction.user.mention}!")
-
 
 @client.tree.command(name="profile", description="Show your profile or someone else's")
 @app_commands.describe(member="Whose profile to show (leave empty for your own)")
@@ -972,7 +934,6 @@ async def profile(interaction: discord.Interaction, member: discord.Member | Non
     level, into_level, needed = level_from_xp(data["xp"])
     rank = db.rank(interaction.guild.id, data["xp"])
 
-    # Next reward role
     next_reward = "All roles unlocked"
     for required_level, role_name in LEVEL_ROLES:
         if level < required_level:
@@ -999,15 +960,13 @@ async def profile(interaction: discord.Interaction, member: discord.Member | Non
 
     await interaction.response.send_message(embed=embed)
 
-
 def build_leaderboard_embed(guild: discord.Guild, kind: str) -> discord.Embed:
-    """kind is 'xp', 'messages' or 'voice_seconds'."""
     titles = {
         "xp": "Top levels",
         "messages": "Top chatters",
         "voice_seconds": "Top voice time",
     }
-    rows = db.top(guild.id, kind, 50)  # fetch extra in case some people left
+    rows = db.top(guild.id, kind, 50)  
 
     lines = []
     for user_id, xp, messages, voice_seconds in rows:
@@ -1030,12 +989,10 @@ def build_leaderboard_embed(guild: discord.Guild, kind: str) -> discord.Embed:
         colour=PINK,
     )
 
-
 @client.tree.command(name="leaderboard", description="Shows the top levels")
 @app_commands.guild_only()
 async def leaderboard(interaction: discord.Interaction):
     await interaction.response.send_message(embed=build_leaderboard_embed(interaction.guild, "xp"))
-
 
 @client.tree.command(
     name="messagesleaderboard",
@@ -1047,7 +1004,6 @@ async def messagesleaderboard(interaction: discord.Interaction):
         embed=build_leaderboard_embed(interaction.guild, "messages")
     )
 
-
 @client.tree.command(
     name="voiceleaderboard",
     description="Shows the top people who spent the most time in voice chats",
@@ -1058,25 +1014,208 @@ async def voiceleaderboard(interaction: discord.Interaction):
         embed=build_leaderboard_embed(interaction.guild, "voice_seconds")
     )
 
+# ======================================================================
+#  Shop
+# ======================================================================
+SHOP_CATEGORIES = {
+    "nickname": {
+        "label": "Nickname Emojis",
+        "items": [
+            {"key": "blahaj_laying", "name": "Blahaj Laying", "emoji": "Blahaj_laying",
+             "role": "Blahaj Laying", "description": "Classic?", "mups": 20, "vups": 0},
+            {"key": "shy_boykisser", "name": "Shy Boykisser", "emoji": "Shy_kisser",
+             "role": "Shy Boykisser", "description": "For the shy ones ~w~", "mups": 40, "vups": 0},
+            {"key": "blahaj_boykisser", "name": "Blahaj Boykisser", "emoji": "BoykisserBlahaj",
+             "role": "Blahaj Boykisser", "description": "Hugg da sharkw!", "mups": 40, "vups": 0},
+            {"key": "paws_boykisser", "name": "Paws Boykisser", "emoji": "Paws_Boykisser",
+             "role": "Paws Boykisser", "description": "Show them your paws", "mups": 90, "vups": 5},
+            {"key": "kiss_boykisser", "name": "Kiss boykisser", "emoji": "kissing_boykisser",
+             "role": "Kiss boykisser", "description": "Kissing boykisser near you!", "mups": 120, "vups": 20},
+            {"key": "halloween_pumpkin_cat", "name": "Halloween Pumpkin Cat", "emoji": "halloween_pupkin_cat",
+             "role": "Halloween Pumpkin", "description": "Spooky month, silly critters!", "mups": 45, "vups": 5},
+            {"key": "sus_cat", "name": "Sus cat", "emoji": "Cat_Sus",
+             "role": "Sus cat", "description": "Looks suspicious.... Is probably fine...?", "mups": 300, "vups": 100},
+        ],
+    },
+    "special": {
+        "label": "Special Roles",
+        "items": [],
+    },
+}
+SHOP_EMPTY_TEXT = "There is nothing right now! Sowwee ~w~"
+
+def find_emoji(guild: discord.Guild, name: str) -> discord.Emoji | None:
+    lowered = name.lower()
+    for emoji in guild.emojis:
+        if emoji.name.lower() == lowered:
+            return emoji
+    return None
+
+def shop_item_text(guild: discord.Guild, item: dict) -> str:
+    emoji = find_emoji(guild, item["emoji"])
+    icon = f" {emoji}" if emoji else ""
+    return (
+        f"**@Nickname{icon} — {item['name']}!**\n"
+        f"{item['description']}\n"
+        f"Price: {item['mups']} Mups | {item['vups']} Vups"
+    )
+
+class ShopCategorySelect(discord.ui.Select):
+    def __init__(self, shop: "ShopView"):
+        options = [
+            discord.SelectOption(label=category["label"], value=key, default=(key == shop.category))
+            for key, category in SHOP_CATEGORIES.items()
+        ]
+        super().__init__(placeholder="Choose a category!", options=options, row=0)
+        self.shop = shop
+
+    async def callback(self, interaction: discord.Interaction):
+        self.shop.category = self.values[0]
+        self.shop.selected = None
+        self.shop.notice = None
+        self.shop.build()
+        await interaction.response.edit_message(embed=self.shop.make_embed(), view=self.shop)
+
+class ShopItemSelect(discord.ui.Select):
+    def __init__(self, shop: "ShopView"):
+        guild = shop.member.guild
+        options = [
+            discord.SelectOption(
+                label=item["name"],
+                value=item["key"],
+                description=f"{item['mups']} Mups | {item['vups']} Vups",
+                emoji=find_emoji(guild, item["emoji"]),
+                default=(item["key"] == shop.selected),
+            )
+            for item in shop.items()
+        ]
+        super().__init__(placeholder="Choose what to buy!", options=options, row=1)
+        self.shop = shop
+
+    async def callback(self, interaction: discord.Interaction):
+        self.shop.selected = self.values[0]
+        self.shop.build()
+        await interaction.response.edit_message(embed=self.shop.make_embed(), view=self.shop)
+
+class ShopBuyButton(discord.ui.Button):
+    def __init__(self, shop: "ShopView"):
+        super().__init__(label="Buy", style=discord.ButtonStyle.success, row=2)
+        self.shop = shop
+
+    async def callback(self, interaction: discord.Interaction):
+        shop = self.shop
+        item = shop.selected_item()
+        if item is None:
+            await interaction.response.send_message("Pick something to buy first.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        member = interaction.user
+
+        role = find_role(guild, item["role"])
+        if role is None:
+            await interaction.response.send_message(
+                "I can't find that role right now. Please tell a mod.", ephemeral=True
+            )
+            return
+        if role in member.roles:
+            await interaction.response.send_message("You already own this one.", ephemeral=True)
+            return
+
+        data = db.get(guild.id, member.id)
+        missing_mups = max(0, item["mups"] - data["mups"])
+        missing_vups = max(0, item["vups"] - data["vups"])
+        if missing_mups or missing_vups:
+            parts = []
+            if missing_mups:
+                parts.append(f"{missing_mups} more Mups")
+            if missing_vups:
+                parts.append(f"{missing_vups} more Vups")
+            await interaction.response.send_message(
+                f"You need {' and '.join(parts)}.", ephemeral=True
+            )
+            return
+
+        if not db.spend(guild.id, member.id, item["mups"], item["vups"]):
+            await interaction.response.send_message(
+                "You don't have enough for that.", ephemeral=True
+            )
+            return
+
+        try:
+            await member.add_roles(role, reason=f"Bought in the shop: {item['name']}")
+        except (discord.Forbidden, discord.HTTPException):
+            db.refund(guild.id, member.id, item["mups"], item["vups"])
+            await interaction.response.send_message(
+                "I can't give you that role. Please tell a mod to move my role higher.",
+                ephemeral=True,
+            )
+            return
+
+        shop.notice = f"You bought {item['name']}!"
+        shop.selected = None
+        shop.build()
+        await interaction.response.edit_message(embed=shop.make_embed(), view=shop)
+
+class ShopView(discord.ui.View):
+    def __init__(self, member: discord.Member):
+        super().__init__(timeout=600)
+        self.member = member
+        self.category: str | None = None
+        self.selected: str | None = None
+        self.notice: str | None = None
+        self.build()
+
+    def items(self) -> list[dict]:
+        if self.category is None:
+            return []
+        return SHOP_CATEGORIES[self.category]["items"]
+
+    def selected_item(self) -> dict | None:
+        for item in self.items():
+            if item["key"] == self.selected:
+                return item
+        return None
+
+    def build(self):
+        self.clear_items()
+        self.add_item(ShopCategorySelect(self))
+        if self.items():
+            self.add_item(ShopItemSelect(self))
+            self.add_item(ShopBuyButton(self))
+
+    def make_embed(self) -> discord.Embed:
+        guild = self.member.guild
+        data = db.get(guild.id, self.member.id)
+
+        if self.category is None:
+            embed = discord.Embed(
+                title="Silly Shop",
+                description="Welcome in! Pick a category below to see what's on the shelves.",
+                colour=CREAM,
+            )
+            embed.set_footer(
+                text=f"{MUPS_REWARD} Mups for every {MESSAGES_PER_MUPS} messages that earn XP, "
+                     f"{VUPS_REWARD} Vups for every hour in voice"
+            )
+        else:
+            category = SHOP_CATEGORIES[self.category]
+            if category["items"]:
+                body = "\n\n".join(shop_item_text(guild, item) for item in category["items"])
+            else:
+                body = SHOP_EMPTY_TEXT
+            text = f"{self.notice}\n\n{body}" if self.notice else body
+            embed = discord.Embed(title=category["label"], description=text, colour=CREAM)
+
+        embed.add_field(name="Your Mups", value=f"{data['mups']:,}", inline=True)
+        embed.add_field(name="Your Vups", value=f"{data['vups']:,}", inline=True)
+        return embed
 
 @client.tree.command(name="shop", description="Visit the shop")
 @app_commands.guild_only()
 async def shop(interaction: discord.Interaction):
-    data = db.get(interaction.guild.id, interaction.user.id)
-    embed = discord.Embed(
-        title="Silly Shop",
-        description=(
-            "The shelves are empty for now, but the critters are busy stocking them. "
-            "Come back soon!"
-        ),
-        colour=CREAM,
-    )
-    embed.add_field(name="Your Mups", value=f"{data['mups']:,}", inline=True)
-    embed.add_field(name="Your Vups", value=f"{data['vups']:,}", inline=True)
-    embed.set_footer(text=f"{MUPS_REWARD} Mups for every {MESSAGES_PER_MUPS} messages that earn XP, "
-                          f"{VUPS_REWARD} Vups for every hour in voice")
-    await interaction.response.send_message(embed=embed)
-
+    view = ShopView(interaction.user)
+    await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
 
 # ----- Admin setup commands (run them inside the right channel) -----
 @client.tree.command(name="setup_verify", description="Post the verification message (admins only)")
@@ -1099,7 +1238,6 @@ async def setup_verify(interaction: discord.Interaction):
     await channel.send(embed=embed, view=VerifyView())
     await interaction.response.send_message(f"Verification posted in {channel.mention}.", ephemeral=True)
 
-
 @client.tree.command(name="setup_voice", description="Post the create-voice message here (admins only)")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
@@ -1121,7 +1259,6 @@ async def setup_voice(interaction: discord.Interaction):
     await interaction.channel.send(embed=embed, view=CreateVoiceView())
     await interaction.response.send_message("Posted.", ephemeral=True)
 
-
 @client.tree.command(name="setup_roles", description="Post the get-roles message here (admins only)")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
@@ -1138,7 +1275,6 @@ async def setup_roles(interaction: discord.Interaction):
     await interaction.channel.send(embed=embed, view=GetRolesView())
     await interaction.response.send_message("Posted.", ephemeral=True)
 
-
 @client.tree.command(name="test_welcome", description="Preview the welcome message (admins only)")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
@@ -1149,12 +1285,25 @@ async def test_welcome(interaction: discord.Interaction):
         ephemeral=True,
     )
 
-
 # ======================================================================
 #  Hug and pat
 # ======================================================================
-ACTION_COOLDOWN = 15        # seconds between uses, counted per person and per command
-ACTION_REPLY_SECONDS = 10   # how long the target has to answer
+ACTION_COOLDOWN = 15        
+ACTION_REPLY_SECONDS = 10   
+
+# Добавлены .gif на конце ссылок, чтобы картинка прогружалась как Embed 
+PAT_GIFS: list[str] = [
+    "https://klipy.com/gifs/pats-pat-on-head.gif",
+    "https://klipy.com/gifs/furry-headpat.gif",
+    "https://klipy.com/gifs/boykisser-cute-3.gif",
+    "https://klipy.com/gifs/furry-furry-cuddle.gif",
+    "https://klipy.com/gifs/crystal-the-cavern-spirit-28.gif"
+]
+HUG_GIFS: list[str] = [
+    "https://klipy.com/gifs/hugs-221.gif",
+    "https://klipy.com/gifs/hug-227.gif",
+    "https://klipy.com/gifs/3-414.gif"
+]
 
 ACTIONS = {
     "hug": {
@@ -1166,6 +1315,7 @@ ACTIONS = {
         ],
         "asked": "{a} just hugged you! Answer the same?",
         "back": "{b} hugged {a} back, so cozy :3",
+        "gifs": HUG_GIFS,
     },
     "pat": {
         "noun": "pat",
@@ -1176,22 +1326,31 @@ ACTIONS = {
         ],
         "asked": "{a} just patted you! Answer the same?",
         "back": "{b} patted {a} back, so soft :3",
+        "gifs": PAT_GIFS,
     },
 }
 
-# When each person last used each command: (user_id, command) -> time
 action_last_used: dict[tuple[int, str], float] = {}
 
+def pick_gif(action: str) -> str | None:
+    pool = ACTIONS[action]["gifs"]
+    return random.choice(pool) if pool else None
+
+def build_action_embed(text: str, image_url: str | None) -> discord.Embed:
+    embed = discord.Embed(description=text, colour=PINK)
+    if image_url:
+        embed.set_image(url=image_url)
+    return embed
 
 class ActionReplyView(discord.ui.View):
-    """The "Sure!" button. Only the person who got hugged or patted can press it."""
-
-    def __init__(self, action: str, giver: discord.Member, target: discord.Member, first_line: str):
+    def __init__(self, action: str, giver: discord.Member, target: discord.Member,
+                 first_line: str, image_url: str | None):
         super().__init__(timeout=ACTION_REPLY_SECONDS)
         self.action = action
         self.giver = giver
         self.target = target
         self.first_line = first_line
+        self.image_url = image_url
         self.message: discord.Message | None = None
         self.answered = False
 
@@ -1206,20 +1365,19 @@ class ActionReplyView(discord.ui.View):
         self.answered = True
         self.stop()
         back = ACTIONS[self.action]["back"].format(a=self.giver.mention, b=self.target.mention)
-        await interaction.response.edit_message(
-            content=f"{self.first_line}\n{back}", view=None
-        )
+        embed = build_action_embed(f"{self.first_line}\n{back}", pick_gif(self.action))
+        await interaction.response.edit_message(embed=embed, view=None)
 
     async def on_timeout(self):
         if self.answered or self.message is None:
             return
         noun = ACTIONS[self.action]["noun"]
         ignored = f"{self.target.mention} didn't answer {self.giver.mention}'s {noun}..."
+        embed = build_action_embed(f"{self.first_line}\n{ignored}", self.image_url)
         try:
-            await self.message.edit(content=f"{self.first_line}\n{ignored}", view=None)
+            await self.message.edit(embed=embed, view=None)
         except (discord.NotFound, discord.HTTPException):
             pass
-
 
 async def run_action(interaction: discord.Interaction, name: str, target: discord.Member):
     giver = interaction.user
@@ -1235,7 +1393,6 @@ async def run_action(interaction: discord.Interaction, name: str, target: discor
         )
         return
 
-    # Cooldown (only the person who used the command sees this)
     now = time.time()
     key = (giver.id, name)
     remaining = ACTION_COOLDOWN - (now - action_last_used.get(key, 0))
@@ -1251,15 +1408,16 @@ async def run_action(interaction: discord.Interaction, name: str, target: discor
     config = ACTIONS[name]
     first_line = random.choice(config["lines"]).format(a=giver.mention, b=target.mention)
     asked = config["asked"].format(a=giver.mention)
+    image_url = pick_gif(name)
 
-    view = ActionReplyView(name, giver, target, first_line)
+    view = ActionReplyView(name, giver, target, first_line, image_url)
     await interaction.response.send_message(
-        f"{first_line}\n{asked}",
+        content=target.mention,
+        embed=build_action_embed(f"{first_line}\n{asked}", image_url),
         view=view,
-        allowed_mentions=discord.AllowedMentions(users=[target]),  # only the target gets pinged
+        allowed_mentions=discord.AllowedMentions(users=[target]),
     )
     view.message = await interaction.original_response()
-
 
 @client.tree.command(name="hug", description="Give someone a hug")
 @app_commands.describe(user="Who do you want to hug?")
@@ -1267,13 +1425,11 @@ async def run_action(interaction: discord.Interaction, name: str, target: discor
 async def hug(interaction: discord.Interaction, user: discord.Member):
     await run_action(interaction, "hug", user)
 
-
 @client.tree.command(name="pat", description="Give someone a pat")
 @app_commands.describe(user="Who do you want to pat?")
 @app_commands.guild_only()
 async def pat(interaction: discord.Interaction, user: discord.Member):
     await run_action(interaction, "pat", user)
-
 
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN environment variable is not set")

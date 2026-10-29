@@ -28,21 +28,21 @@ LEVEL_ROLES = [
     (15, "PAWSOME"),
 ]
 
-# СДЕЛАЛ ОПЫТ ЛЕГЧЕ:
-XP_MIN = 25         # Раньше 15
-XP_MAX = 40         # Раньше 25
-XP_COOLDOWN = 20    # Раньше 60 секунд
+# XP (Easy):
+XP_MIN = 25         
+XP_MAX = 40         
+XP_COOLDOWN = 20    
 
-# СДЕЛАЛ АНТИ-СПАМ МЯГЧЕ:
-MIN_LETTERS = 2            # Раньше 4
-MIN_UNIQUE_LETTERS = 2     # Раньше 3
+# ANTI-SPAM (Soft):
+MIN_LETTERS = 2            
+MIN_UNIQUE_LETTERS = 2     
 SPAM_HISTORY = 5           
 SIMILARITY_LIMIT = 0.85    
 
-# СДЕЛАЛ ФАРМ ВАЛЮТЫ БЫСТРЕЕ:
-MESSAGES_PER_MUPS = 25     # Раньше 100
-MUPS_REWARD = 15           # Раньше 10
-VOICE_SECONDS_PER_VUPS = 1800  # Раньше 3600 (1 час), теперь 30 минут
+# CURRENCY (Fast):
+MESSAGES_PER_MUPS = 25     
+MUPS_REWARD = 15           
+VOICE_SECONDS_PER_VUPS = 1800  
 VUPS_REWARD = 1                
 
 VOICE_MAX_LIMIT = 10
@@ -92,7 +92,6 @@ CREAM = discord.Colour.from_str("#f7e7d3")
 
 intents = discord.Intents.default()
 intents.members = True
-# ИСПРАВЛЕНИЕ ОШИБКИ С ОПЫТОМ (Бот теперь видит текст сообщений):
 intents.message_content = True
 
 
@@ -122,7 +121,7 @@ class Database:
             """
         )
         columns = {row[1] for row in self.conn.execute("PRAGMA table_info(users)")}
-        for column in ("mups", "vups", "xp_messages"):
+        for column in ("mups", "vups", "xp_messages", "cookies_received", "cookies_given", "last_cookie_given"):
             if column not in columns:
                 self.conn.execute(
                     f"ALTER TABLE users ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
@@ -183,12 +182,13 @@ class Database:
 
     def get(self, guild_id: int, user_id: int):
         row = self.conn.execute(
-            "SELECT xp, messages, pings, voice_seconds, mups, vups FROM users "
+            "SELECT xp, messages, pings, voice_seconds, mups, vups, cookies_received, cookies_given, last_cookie_given FROM users "
             "WHERE guild_id = ? AND user_id = ?",
             (guild_id, user_id),
         ).fetchone()
         if row is None:
-            return {"xp": 0, "messages": 0, "pings": 0, "voice_seconds": 0, "mups": 0, "vups": 0}
+            return {"xp": 0, "messages": 0, "pings": 0, "voice_seconds": 0, "mups": 0, "vups": 0, 
+                    "cookies_received": 0, "cookies_given": 0, "last_cookie_given": 0}
         return {
             "xp": row[0],
             "messages": row[1],
@@ -196,6 +196,9 @@ class Database:
             "voice_seconds": row[3],
             "mups": row[4],
             "vups": row[5],
+            "cookies_received": row[6],
+            "cookies_given": row[7],
+            "last_cookie_given": row[8],
         }
 
     def rank(self, guild_id: int, xp: int) -> int:
@@ -242,6 +245,19 @@ class Database:
         self.conn.execute(
             "UPDATE users SET mups = mups + ?, vups = vups + ? WHERE guild_id = ? AND user_id = ?",
             (mups, vups, guild_id, user_id)
+        )
+        self.conn.commit()
+        
+    def give_cookie(self, guild_id: int, giver_id: int, receiver_id: int, now: int):
+        self._ensure(guild_id, giver_id)
+        self._ensure(guild_id, receiver_id)
+        self.conn.execute(
+            "UPDATE users SET cookies_given = cookies_given + 1, last_cookie_given = ? WHERE guild_id = ? AND user_id = ?",
+            (now, guild_id, giver_id)
+        )
+        self.conn.execute(
+            "UPDATE users SET cookies_received = cookies_received + 1 WHERE guild_id = ? AND user_id = ?",
+            (guild_id, receiver_id)
         )
         self.conn.commit()
 
@@ -970,11 +986,15 @@ async def profile(interaction: discord.Interaction, member: discord.Member | Non
         colour=colour,
     )
     embed.set_thumbnail(url=target_member.display_avatar.url)
+    
+    embed.add_field(name="Mups", value=f"{data['mups']:,}", inline=True)
+    embed.add_field(name="Vups", value=f"{data['vups']:,}", inline=True)
+    embed.add_field(name="Cookies", value=f"🍪 {data['cookies_received']:,}", inline=True)
+    
     embed.add_field(name="Messages sent", value=f"{data['messages']:,}", inline=True)
     embed.add_field(name="Pings sent", value=f"{data['pings']:,}", inline=True)
     embed.add_field(name="Time in voice", value=format_duration(data["voice_seconds"]), inline=True)
-    embed.add_field(name="Mups", value=f"{data['mups']:,}", inline=True)
-    embed.add_field(name="Vups", value=f"{data['vups']:,}", inline=True)
+    
     embed.add_field(name="Next reward", value=next_reward, inline=False)
     embed.set_footer(text=f"Total XP: {data['xp']:,}")
 
@@ -1026,6 +1046,59 @@ async def currencyleaderboard(interaction: discord.Interaction):
         if member is None: continue
         lines.append(f"**#{len(lines) + 1}** {member.display_name} | {mups:,} Mups")
     embed = discord.Embed(title="Top Richest Critters (Mups)", description="\n".join(lines) if lines else "Nobody has Mups yet!", colour=PINK)
+    await interaction.response.send_message(embed=embed)
+
+
+# ======================================================================
+#  Cookies! 🍪
+# ======================================================================
+@client.tree.command(name="award_cookie", description="Give one cookie to someone every 24 hours :3")
+@app_commands.describe(user="Who do you want to give a cookie to?")
+@app_commands.guild_only()
+async def award_cookie(interaction: discord.Interaction, user: discord.Member):
+    giver = interaction.user
+    
+    if user.id == giver.id:
+        await interaction.response.send_message("You can't give a cookie to yourself! Share with others :3", ephemeral=True)
+        return
+        
+    if user.bot:
+        await interaction.response.send_message("Bots don't eat cookies, they eat RAM! Pick a real person.", ephemeral=True)
+        return
+        
+    guild_id = interaction.guild.id
+    data = db.get(guild_id, giver.id)
+    
+    now = int(time.time())
+    cooldown = 24 * 60 * 60  
+    last_given = data.get("last_cookie_given", 0)
+    
+    if now - last_given < cooldown:
+        remaining = cooldown - (now - last_given)
+        hours, remainder = divmod(remaining, 3600)
+        minutes, _ = divmod(remainder, 60)
+        await interaction.response.send_message(
+            f"You already gave a cookie today! You can give another one in {hours}h {minutes}m.", 
+            ephemeral=True
+        )
+        return
+        
+    db.give_cookie(guild_id, giver.id, user.id, now)
+    await interaction.response.send_message(f"🍪 {giver.mention} gave a delicious cookie to {user.mention}! So sweet :3")
+
+
+@client.tree.command(name="my_cookies", description="Check how many cookies you have and gave")
+@app_commands.guild_only()
+async def my_cookies(interaction: discord.Interaction):
+    data = db.get(interaction.guild.id, interaction.user.id)
+    received = data.get("cookies_received", 0)
+    given = data.get("cookies_given", 0)
+    
+    embed = discord.Embed(
+        title=f"🍪 {interaction.user.display_name}'s Cookie Jar",
+        description=f"**Cookies received:** {received}\n**Cookies given:** {given}",
+        colour=CREAM
+    )
     await interaction.response.send_message(embed=embed)
 
 
@@ -1133,7 +1206,7 @@ class ShopView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.member.id: return True
-        await interaction.response.send_message("Это не твой магазин! Напиши /shop, чтобы открыть свой.", ephemeral=True)
+        await interaction.response.send_message("This is not your shop! Type /shop to open your own.", ephemeral=True)
         return False
 
     def items(self) -> list[dict]:

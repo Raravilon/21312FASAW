@@ -26,6 +26,9 @@ LEVEL_ROLES = [
     (3, "Silly Critter"),
     (10, "Friendly"),
     (15, "PAWSOME"),
+    (50, "🧃Half of a Goober🧃"),
+    (85, "Maplet..........."),
+    (100, "🍁MAPLE SYROUP🍁"),
 ]
 
 # XP (Easy):
@@ -144,16 +147,18 @@ class Database:
             (guild_id, user_id),
         )
 
-    def add_message(self, guild_id: int, user_id: int, pings: int, xp_gain: int, counted: bool = True):
+    def add_message(self, guild_id: int, user_id: int, pings: int, xp_gain: int, counted: bool = True, booster_mult: float = 1.0):
         self._ensure(guild_id, user_id)
         old_xp, old_xp_messages = self.conn.execute(
             "SELECT xp, xp_messages FROM users WHERE guild_id = ? AND user_id = ?",
             (guild_id, user_id),
         ).fetchone()
         new_xp_messages = old_xp_messages + (1 if xp_gain > 0 else 0)
-        mups_gain = (
-            new_xp_messages // MESSAGES_PER_MUPS - old_xp_messages // MESSAGES_PER_MUPS
-        ) * MUPS_REWARD
+        
+        cycles_old = old_xp_messages // MESSAGES_PER_MUPS
+        cycles_new = new_xp_messages // MESSAGES_PER_MUPS
+        mups_gain = int((cycles_new - cycles_old) * MUPS_REWARD * booster_mult)
+        
         self.conn.execute(
             "UPDATE users SET messages = messages + ?, pings = pings + ?, xp = xp + ?, "
             "xp_messages = ?, mups = mups + ? WHERE guild_id = ? AND user_id = ?",
@@ -383,33 +388,71 @@ def find_channel_mention(guild: discord.Guild, keyword: str) -> str:
     return channel.mention if channel else f"#{keyword}"
 
 # ======================================================================
-#  Shop Data
+#  Shop Data (Packs)
 # ======================================================================
+HALLOWEEN_EXPIRY = 1799020800  # Nov 4, 2026 (00:00:00 UTC) - covers all of Nov 3
+
 SHOP_CATEGORIES = {
-    "nickname": {
-        "label": "Nickname Emojis",
+    "expie": {
+        "label": "Expie Pack",
+        "flag": "NEW",
         "items": [
-            {"key": "blahaj_laying", "name": "Blahaj Laying", "emoji": "Blahaj_laying",
-             "role": "Blahaj Laying", "description": "Classic?", "mups": 20, "vups": 0},
-            {"key": "shy_boykisser", "name": "Shy Boykisser", "emoji": "Shy_kisser",
-             "role": "Shy Boykisser", "description": "For the shy ones ~w~", "mups": 40, "vups": 0},
-            {"key": "blahaj_boykisser", "name": "Blahaj Boykisser", "emoji": "BoykisserBlahaj",
-             "role": "Blahaj Boykisser", "description": "Hugg da sharkw!", "mups": 40, "vups": 0},
-            {"key": "paws_boykisser", "name": "Paws Boykisser", "emoji": "Paws_Boykisser",
-             "role": "Paws Boykisser", "description": "Show them your paws", "mups": 90, "vups": 5},
-            {"key": "kiss_boykisser", "name": "Kiss boykisser", "emoji": "kissing_boykisser",
-             "role": "Kiss boykisser", "description": "Kissing boykisser near you!", "mups": 120, "vups": 20},
-            {"key": "halloween_pumpkin_cat", "name": "Halloween Pumpkin Cat", "emoji": "halloween_pupkin_cat",
-             "role": "Halloween Pumpkin", "description": "Spooky month, silly critters!", "mups": 45, "vups": 5},
-            {"key": "sus_cat", "name": "Sus cat", "emoji": "Cat_Sus",
-             "role": "Sus cat", "description": "Looks suspicious.... Is probably fine...?", "mups": 300, "vups": 100},
+            {"key": "expie_heart", "name": "Expie Heart", "emoji": "Expie_Heart", "role": "Expie Heart", "description": "idk jsut a hearatea weeweweweewe", "mups": 10, "vups": 0},
+            {"key": "brain_damage", "name": "BRAIN DAMAGE", "emoji": "BRAIN_DAMAGE", "role": "BRAIN DAMAGE", "description": "Brain.exe has stopped working", "mups": 40, "vups": 0},
+            {"key": "blehh_expie", "name": "Blehh Expie", "emoji": "De_plehxpie", "role": "Blehh Expie", "description": "Blehhh!", "mups": 100, "vups": 50},
         ],
     },
-    "special": {
-        "label": "Special Roles",
-        "items": [],
+    "other": {
+        "label": "Other",
+        "flag": "",
+        "items": [
+            {"key": "cool_femboy", "name": "Cool femboy", "emoji": "Da_cool_femboy", "role": "Cool femboy", "description": "Da cool femboy!", "mups": 60, "vups": 0},
+        ],
     },
+    "halloween": {
+        "label": "Halloween Pack",
+        "flag": "LIMITED",
+        "expiry": HALLOWEEN_EXPIRY,
+        "items": [
+            {"key": "halloween_pumpkin_cat", "name": "Halloween Pumpkin Cat", "emoji": "halloween_pupkin_cat", "role": "Halloween Pumpkin", "description": "Spooky month, silly critters!", "mups": 45, "vups": 5},
+        ],
+    },
+    "silly": {
+        "label": "Silly Pack",
+        "flag": "",
+        "items": [
+            {"key": "blahaj_laying", "name": "Blahaj Laying", "emoji": "Blahaj_laying", "role": "Blahaj Laying", "description": "Classic?", "mups": 20, "vups": 0},
+            {"key": "sus_cat", "name": "Sus cat", "emoji": "Cat_Sus", "role": "Sus cat", "description": "Looks suspicious.... Is probably fine...?", "mups": 300, "vups": 100},
+            {"key": "true", "name": "TRUE...", "emoji": "De_true", "role": "TRUE...", "description": "who is he.?", "mups": 500, "vups": 0},
+        ],
+    },
+    "boykisser": {
+        "label": "Boykisser Pack",
+        "flag": "",
+        "items": [
+            {"key": "shy_boykisser", "name": "Shy Boykisser", "emoji": "Shy_kisser", "role": "Shy Boykisser", "description": "For the shy ones ~w~", "mups": 40, "vups": 0},
+            {"key": "blahaj_boykisser", "name": "Blahaj Boykisser", "emoji": "BoykisserBlahaj", "role": "Blahaj Boykisser", "description": "Hugg da sharkw!", "mups": 40, "vups": 0},
+            {"key": "paws_boykisser", "name": "Paws Boykisser", "emoji": "Paws_Boykisser", "role": "Paws Boykisser", "description": "Show them your paws", "mups": 90, "vups": 5},
+            {"key": "kiss_boykisser", "name": "Kiss boykisser", "emoji": "kissing_boykisser", "role": "Kiss boykisser", "description": "Kissing boykisser near you!", "mups": 120, "vups": 20},
+        ],
+    },
+    "wyph": {
+        "label": "WYPH PACK?",
+        "flag": "",
+        "items": [
+            {"key": "wyphlet", "name": "Wyphlet", "emoji": "Wyphlet", "role": "Wyphlet", "description": "WAIT... A REAL WYP-", "mups": 1000, "vups": 1000},
+        ],
+    }
 }
+
+def get_active_shop_categories():
+    active = {}
+    now = time.time()
+    for key, data in SHOP_CATEGORIES.items():
+        if "expiry" in data and now > data["expiry"]:
+            continue
+        active[key] = data
+    return active
 
 # ======================================================================
 #  Self-assign roles & Profile Edit
@@ -491,7 +534,12 @@ class EmojiSelect(discord.ui.Select):
         self.all_emoji_roles = []
         options = [discord.SelectOption(label="None", value="None")]
         
-        for item in SHOP_CATEGORIES["nickname"]["items"]:
+        # Gather all items from all categories
+        all_items = []
+        for cat_data in SHOP_CATEGORIES.values():
+            all_items.extend(cat_data["items"])
+            
+        for item in all_items:
             role = find_role(guild, item["role"])
             if role:
                 self.all_emoji_roles.append(role)
@@ -857,7 +905,12 @@ async def voice_tracker():
             state = member.voice
             if state is None or state.channel != channel: continue
             if state.deaf or state.self_deaf: continue
-            db.add_voice(guild.id, member.id, 60)
+            
+            # Booster perk: 1.5x Vups speed (90 seconds of progress per 60 seconds)
+            has_booster = any("CERTIFIED PAWBOOSTER" in r.name.upper() for r in member.roles)
+            booster_mult = 1.5 if has_booster else 1.0
+            
+            db.add_voice(guild.id, member.id, int(60 * booster_mult))
 
 @voice_tracker.before_loop
 async def before_voice_tracker():
@@ -927,7 +980,11 @@ async def on_message(message: discord.Message):
         gain = random.randint(XP_MIN, XP_MAX)
         last_xp_time[key] = now
 
-    old_xp, new_xp, _mups = db.add_message(message.guild.id, member.id, pings, gain, counted)
+    # Booster perk: 1.5x Mups
+    has_booster = any("CERTIFIED PAWBOOSTER" in r.name.upper() for r in member.roles)
+    booster_mult = 1.5 if has_booster else 1.0
+
+    old_xp, new_xp, _mups = db.add_message(message.guild.id, member.id, pings, gain, counted, booster_mult)
     old_level = level_from_xp(old_xp)[0]
     new_level = level_from_xp(new_xp)[0]
     
@@ -1005,6 +1062,31 @@ async def profile(interaction: discord.Interaction, member: discord.Member | Non
         await interaction.response.send_message(embed=embed)
 
 
+@client.tree.command(name="progress", description="See your level progress and upcoming roles!")
+@app_commands.guild_only()
+async def progress(interaction: discord.Interaction):
+    data = db.get(interaction.guild.id, interaction.user.id)
+    current_level, into_level, needed = level_from_xp(data["xp"])
+    
+    lines = []
+    next_found = False
+    for req_level, role_name in LEVEL_ROLES:
+        if current_level >= req_level:
+            lines.append(f"✅ **Level {req_level}:** {role_name} *(Unlocked!)*")
+        elif not next_found:
+            lines.append(f"🔄 **Level {req_level}:** {role_name} *(Next!)*")
+            next_found = True
+        else:
+            lines.append(f"🔒 **Level {req_level}:** {role_name}")
+            
+    embed = discord.Embed(
+        title="📈 Your Level Progress",
+        description=f"**Current Level: {current_level}**\n`{progress_bar(into_level, needed)}` {into_level:,} / {needed:,} XP\n\n**Role Unlocks:**\n" + "\n".join(lines),
+        colour=PINK
+    )
+    await interaction.response.send_message(embed=embed)
+
+
 def build_leaderboard_embed(guild: discord.Guild, kind: str) -> discord.Embed:
     titles = {"xp": "Top levels", "messages": "Top chatters", "voice_seconds": "Top voice time"}
     rows = db.top(guild.id, kind, 50)  
@@ -1069,8 +1151,12 @@ async def award_cookie(interaction: discord.Interaction, user: discord.Member):
     guild_id = interaction.guild.id
     data = db.get(guild_id, giver.id)
     
+    # Booster perk: 20% less cooldown for cookies (19.2 hours instead of 24)
+    has_booster = any("CERTIFIED PAWBOOSTER" in r.name.upper() for r in giver.roles)
+    base_cooldown = 24 * 60 * 60
+    cooldown = int(base_cooldown * 0.8) if has_booster else base_cooldown
+    
     now = int(time.time())
-    cooldown = 24 * 60 * 60  
     last_given = data.get("last_cookie_given", 0)
     
     if now - last_given < cooldown:
@@ -1078,7 +1164,7 @@ async def award_cookie(interaction: discord.Interaction, user: discord.Member):
         hours, remainder = divmod(remaining, 3600)
         minutes, _ = divmod(remainder, 60)
         await interaction.response.send_message(
-            f"You already gave a cookie today! You can give another one in {hours}h {minutes}m.", 
+            f"You already gave a cookie! You can give another one in {hours}h {minutes}m.", 
             ephemeral=True
         )
         return
@@ -1120,8 +1206,21 @@ def shop_item_text(guild: discord.Guild, item: dict) -> str:
 
 class ShopCategorySelect(discord.ui.Select):
     def __init__(self, shop: "ShopView"):
-        options = [discord.SelectOption(label=category["label"], value=key, default=(key == shop.category)) for key, category in SHOP_CATEGORIES.items()]
-        super().__init__(placeholder="Choose a category!", options=options, row=0)
+        active_categories = get_active_shop_categories()
+        options = []
+        for key, category in active_categories.items():
+            flag_text = f" ({category['flag']})" if category.get("flag") else ""
+            item_count = len(category["items"])
+            item_text = f"{item_count} item{'s' if item_count != 1 else ''}"
+            
+            options.append(discord.SelectOption(
+                label=category["label"], 
+                value=key, 
+                description=f"{flag_text} {item_text}".strip(),
+                default=(key == shop.category)
+            ))
+            
+        super().__init__(placeholder="Choose a pack!", options=options, row=0)
         self.shop = shop
 
     async def callback(self, interaction: discord.Interaction):
@@ -1211,7 +1310,9 @@ class ShopView(discord.ui.View):
 
     def items(self) -> list[dict]:
         if self.category is None: return []
-        return SHOP_CATEGORIES[self.category]["items"]
+        active_categories = get_active_shop_categories()
+        if self.category not in active_categories: return []
+        return active_categories[self.category]["items"]
 
     def selected_item(self) -> dict | None:
         for item in self.items():
@@ -1229,14 +1330,22 @@ class ShopView(discord.ui.View):
         guild = self.member.guild
         data = db.get(guild.id, self.member.id)
         if self.category is None:
-            embed = discord.Embed(title="Silly Shop", description="Welcome in! Pick a category below to see what's on the shelves.", colour=CREAM)
-            embed.set_footer(text=f"{MUPS_REWARD} Mups for every {MESSAGES_PER_MUPS} messages that earn XP, {VUPS_REWARD} Vups for every 30 minutes in voice")
+            desc = "Welcome in! Pick a pack below to see what's on the shelves.\n\n✨ **NEW:** Expie Pack, just arrived!\n🎃 **LIMITED:** Halloween Pack, available until Nov 3!"
+            embed = discord.Embed(title="Silly Shop", description=desc, colour=CREAM)
+            embed.set_footer(text="Boosters get 1.5x Mups and Vups!")
         else:
-            category = SHOP_CATEGORIES[self.category]
-            if category["items"]: body = "\n\n".join(shop_item_text(guild, item) for item in category["items"])
-            else: body = SHOP_EMPTY_TEXT
-            text = f"{self.notice}\n\n{body}" if self.notice else body
-            embed = discord.Embed(title=category["label"], description=text, colour=CREAM)
+            active_categories = get_active_shop_categories()
+            if self.category in active_categories:
+                category = active_categories[self.category]
+                if category["items"]: body = "\n\n".join(shop_item_text(guild, item) for item in category["items"])
+                else: body = SHOP_EMPTY_TEXT
+                text = f"{self.notice}\n\n{body}" if self.notice else body
+                
+                flag_text = f" [{category['flag']}]" if category.get("flag") else ""
+                embed = discord.Embed(title=f"{category['label']}{flag_text}", description=text, colour=CREAM)
+            else:
+                embed = discord.Embed(title="Error", description="This pack is no longer available.", colour=CREAM)
+                
         embed.add_field(name="Your Mups", value=f"{data['mups']:,}", inline=True)
         embed.add_field(name="Your Vups", value=f"{data['vups']:,}", inline=True)
         return embed

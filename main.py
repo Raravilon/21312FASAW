@@ -31,10 +31,13 @@ LEVEL_ROLES = [
     (100, "🍁MAPLE SYROUP🍁"),
 ]
 
-# XP (Easy):
-XP_MIN = 25         
-XP_MAX = 40         
-XP_COOLDOWN = 20    
+# XP (Increased Base XP):
+XP_MIN = 20         
+XP_MAX = 35         
+XP_COOLDOWN = 10    
+
+# ANTI-AI BOTTING (Fatigue System):
+MAX_XP_PER_HOUR = 100      # Max XP-earning messages per hour to prevent 24/7 AI farming
 
 # ANTI-SPAM (Soft):
 MIN_LETTERS = 2            
@@ -153,16 +156,18 @@ class Database:
             "SELECT xp, xp_messages FROM users WHERE guild_id = ? AND user_id = ?",
             (guild_id, user_id),
         ).fetchone()
+        
         new_xp_messages = old_xp_messages + (1 if xp_gain > 0 else 0)
         
         cycles_old = old_xp_messages // MESSAGES_PER_MUPS
         cycles_new = new_xp_messages // MESSAGES_PER_MUPS
         mups_gain = int((cycles_new - cycles_old) * MUPS_REWARD * booster_mult)
         
+        # messages = messages + 1 ALWAYS increments so every message counts in profile
         self.conn.execute(
-            "UPDATE users SET messages = messages + ?, pings = pings + ?, xp = xp + ?, "
+            "UPDATE users SET messages = messages + 1, pings = pings + ?, xp = xp + ?, "
             "xp_messages = ?, mups = mups + ? WHERE guild_id = ? AND user_id = ?",
-            (1 if counted else 0, pings, xp_gain, new_xp_messages, mups_gain, guild_id, user_id),
+            (pings, xp_gain, new_xp_messages, mups_gain, guild_id, user_id),
         )
         self.conn.commit()
         return old_xp, old_xp + xp_gain, mups_gain
@@ -390,7 +395,7 @@ def find_channel_mention(guild: discord.Guild, keyword: str) -> str:
 # ======================================================================
 #  Shop Data (Packs)
 # ======================================================================
-HALLOWEEN_EXPIRY = 1799020800  # Nov 4, 2026 (00:00:00 UTC) - covers all of Nov 3
+HALLOWEEN_EXPIRY = 1799020800  # Nov 4, 2026
 
 SHOP_CATEGORIES = {
     "expie": {
@@ -534,7 +539,6 @@ class EmojiSelect(discord.ui.Select):
         self.all_emoji_roles = []
         options = [discord.SelectOption(label="None", value="None")]
         
-        # Gather all items from all categories
         all_items = []
         for cat_data in SHOP_CATEGORIES.values():
             all_items.extend(cat_data["items"])
@@ -873,6 +877,9 @@ client = SillyBot()
 last_xp_time: dict[tuple[int, int], float] = {}
 recent_messages: dict[tuple[int, int], deque] = {}
 
+# ANTI-AI TRACKER
+xp_timestamps: dict[tuple[int, int], deque] = {}
+
 URL_RE = re.compile(r"https?://\S+")
 DISCORD_TAG_RE = re.compile(r"<a?:\w+:\d+>|<[@#][!&]?\d+>")  
 
@@ -906,7 +913,6 @@ async def voice_tracker():
             if state is None or state.channel != channel: continue
             if state.deaf or state.self_deaf: continue
             
-            # Booster perk: 1.5x Vups speed (90 seconds of progress per 60 seconds)
             has_booster = any("CERTIFIED PAWBOOSTER" in r.name.upper() for r in member.roles)
             booster_mult = 1.5 if has_booster else 1.0
             
@@ -976,11 +982,28 @@ async def on_message(message: discord.Message):
 
     now = time.time()
     gain = 0
+    
     if counted and now - last_xp_time.get(key, 0) >= XP_COOLDOWN:
-        gain = random.randint(XP_MIN, XP_MAX)
-        last_xp_time[key] = now
+        
+        # Anti-AI Fatigue System
+        history = xp_timestamps.setdefault(key, deque())
+        while history and now - history[0] > 3600:
+            history.popleft()
+            
+        if len(history) < MAX_XP_PER_HOUR:
+            data = db.get(message.guild.id, member.id)
+            current_level = level_from_xp(data["xp"])[0]
+            
+            base_gain = random.randint(XP_MIN, XP_MAX)
+            level_bonus = int(current_level * 0.5) 
+            gain = base_gain + level_bonus
+            
+            last_xp_time[key] = now
+            history.append(now)
+        else:
+            # Hit the hourly cap. They still get +1 to message count, but 0 XP to prevent AI 24/7 botting.
+            pass
 
-    # Booster perk: 1.5x Mups
     has_booster = any("CERTIFIED PAWBOOSTER" in r.name.upper() for r in member.roles)
     booster_mult = 1.5 if has_booster else 1.0
 
@@ -1072,15 +1095,15 @@ async def progress(interaction: discord.Interaction):
     next_found = False
     for req_level, role_name in LEVEL_ROLES:
         if current_level >= req_level:
-            lines.append(f" **Level {req_level}:** {role_name} *(Unlocked!)*")
+            lines.append(f"✅ **Level {req_level}:** {role_name} *(Unlocked!)*")
         elif not next_found:
-            lines.append(f" **Level {req_level}:** {role_name} *(Next!)*")
+            lines.append(f"🔄 **Level {req_level}:** {role_name} *(Next!)*")
             next_found = True
         else:
-            lines.append(f" **Level {req_level}:** {role_name}")
+            lines.append(f"🔒 **Level {req_level}:** {role_name}")
             
     embed = discord.Embed(
-        title=" Your Level Progress",
+        title="📈 Your Level Progress",
         description=f"**Current Level: {current_level}**\n`{progress_bar(into_level, needed)}` {into_level:,} / {needed:,} XP\n\n**Role Unlocks:**\n" + "\n".join(lines),
         colour=PINK
     )
@@ -1151,7 +1174,6 @@ async def award_cookie(interaction: discord.Interaction, user: discord.Member):
     guild_id = interaction.guild.id
     data = db.get(guild_id, giver.id)
     
-    # Booster perk: 20% less cooldown for cookies (19.2 hours instead of 24)
     has_booster = any("CERTIFIED PAWBOOSTER" in r.name.upper() for r in giver.roles)
     base_cooldown = 24 * 60 * 60
     cooldown = int(base_cooldown * 0.8) if has_booster else base_cooldown
@@ -1330,7 +1352,7 @@ class ShopView(discord.ui.View):
         guild = self.member.guild
         data = db.get(guild.id, self.member.id)
         if self.category is None:
-            desc = "Welcome in! Pick a pack below to see what's on the shelves.\n\n **NEW:** Expie Pack, just arrived!\n **LIMITED:** Halloween Pack, available until Nov 3!"
+            desc = "Welcome in! Pick a pack below to see what's on the shelves.\n\n✨ **NEW:** Expie Pack, just arrived!\n🎃 **LIMITED:** Halloween Pack, available until Nov 3!"
             embed = discord.Embed(title="Silly Shop", description=desc, colour=CREAM)
             embed.set_footer(text="Boosters get 1.5x Mups and Vups!")
         else:

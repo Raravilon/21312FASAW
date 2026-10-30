@@ -1072,15 +1072,15 @@ async def progress(interaction: discord.Interaction):
     next_found = False
     for req_level, role_name in LEVEL_ROLES:
         if current_level >= req_level:
-            lines.append(f"✅ **Level {req_level}:** {role_name} *(Unlocked!)*")
+            lines.append(f" **Level {req_level}:** {role_name} *(Unlocked!)*")
         elif not next_found:
-            lines.append(f"🔄 **Level {req_level}:** {role_name} *(Next!)*")
+            lines.append(f" **Level {req_level}:** {role_name} *(Next!)*")
             next_found = True
         else:
-            lines.append(f"🔒 **Level {req_level}:** {role_name}")
+            lines.append(f" **Level {req_level}:** {role_name}")
             
     embed = discord.Embed(
-        title="📈 Your Level Progress",
+        title=" Your Level Progress",
         description=f"**Current Level: {current_level}**\n`{progress_bar(into_level, needed)}` {into_level:,} / {needed:,} XP\n\n**Role Unlocks:**\n" + "\n".join(lines),
         colour=PINK
     )
@@ -1330,7 +1330,7 @@ class ShopView(discord.ui.View):
         guild = self.member.guild
         data = db.get(guild.id, self.member.id)
         if self.category is None:
-            desc = "Welcome in! Pick a pack below to see what's on the shelves.\n\n✨ **NEW:** Expie Pack, just arrived!\n🎃 **LIMITED:** Halloween Pack, available until Nov 3!"
+            desc = "Welcome in! Pick a pack below to see what's on the shelves.\n\n **NEW:** Expie Pack, just arrived!\n **LIMITED:** Halloween Pack, available until Nov 3!"
             embed = discord.Embed(title="Silly Shop", description=desc, colour=CREAM)
             embed.set_footer(text="Boosters get 1.5x Mups and Vups!")
         else:

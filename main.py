@@ -20,40 +20,72 @@ GUILD_ID = int(os.getenv("GUILD_ID", "1564401949019869224"))
 WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", "1564405099004956702"))
 VERIFY_CHANNEL_ID = int(os.getenv("VERIFY_CHANNEL_ID", "1564405761105461379"))
 
+# Optional: channel for bot warnings to moderators (0 = look for a channel
+# named "mod-log" or "moderator-only")
+MOD_LOG_CHANNEL_ID = int(os.getenv("MOD_LOG_CHANNEL_ID", "0"))
+
 JOINED_ROLE_NAME = os.getenv("JOINED_ROLE_NAME", "Just joined!")
 NEWCOMER_ROLE_NAME = os.getenv("NEWCOMER_ROLE_NAME", "Newcomer :3")
 
+# Level rewards. Names are matched ignoring case, emojis and punctuation, so
+# "MAPLE SYROUP" finds "🍁 MAPLE SYROUP 🍁".
+# IMPORTANT: the level-85 role is "Maplet..........." (with dots). It is looked up as
+# "Maplet..." so it can never be confused with the shop role called just "Maplet".
 LEVEL_ROLES = [
     (3, "Silly Critter"),
     (10, "Friendly"),
     (15, "PAWSOME"),
     (50, "Half of a Goober"),
-    (85, "Maplet"),
+    (85, "Maplet..."),
     (100, "MAPLE SYROUP"),
 ]
 
-# XP (Increased Base XP):
-XP_MIN = 20         
-XP_MAX = 35         
-XP_COOLDOWN = 10    
+# ----------------------------------------------------------------------
+#  XP system
+# ----------------------------------------------------------------------
+XP_MIN = 5
+XP_MAX = 25
+XP_COOLDOWN_RANGE = (15, 40)    # random seconds between two XP gains (hidden from players)
 
-# ANTI-AI BOTTING (Fatigue System):
-MAX_XP_PER_HOUR = 100      
+# Fatigue: the more XP gains in the last hour, the less each one is worth.
+# (gains in the last hour below this number, multiplier). No hard wall.
+FATIGUE_STEPS = [(30, 1.0), (50, 0.7), (70, 0.4), (10**9, 0.15)]
+
+# Message quality (by number of different words)
+SINGLE_WORD_MULT = 0.25         # 1 word
+SHORT_MULT = 0.6                # 2-3 words
+LONG_MULT = 1.2                 # 10+ words
+
+# Someone else must be talking too, otherwise XP is reduced
+COMPANY_WINDOW = 5 * 60         # "someone else wrote here in the last 5 minutes"
+SOLO_MULTIPLIER = 0.3
+REPLY_BONUS = 1.15              # replying to another person
+
+# Mechanical-looking timing detector (scripts / macros)
+MECH_MESSAGES = 8               # look at the last 8 messages
+MECH_TOLERANCE = 1.5            # all gaps within 1.5 s of each other ...
+MECH_MIN_GAP = 3.0              # ... and every gap at least 3 s = suspicious
+SUSPICIOUS_SECONDS = 30 * 60    # reduced XP for this long
+SUSPICIOUS_MULTIPLIER = 0.2
+
+# Voice also gives a little XP (only with 2+ people who can hear)
+VOICE_XP_PER_MINUTE = 5
 
 # ANTI-SPAM (Soft):
-MIN_LETTERS = 2            
-MIN_UNIQUE_LETTERS = 2     
-SPAM_HISTORY = 5           
-SIMILARITY_LIMIT = 0.85    
+MIN_LETTERS = 2
+MIN_UNIQUE_LETTERS = 2
+SPAM_HISTORY = 5
+SIMILARITY_LIMIT = 0.85
 
 # CURRENCY (Fast):
-MESSAGES_PER_MUPS = 25     
-MUPS_REWARD = 15           
-VOICE_SECONDS_PER_VUPS = 1800  
-VUPS_REWARD = 1                
+MESSAGES_PER_MUPS = 25
+MUPS_REWARD = 15
+MUPS_ELIGIBLE_PER_HOUR = 60     # only the first 60 XP gains per hour count towards Mups
+VOICE_SECONDS_PER_VUPS = 1800
+VUPS_REWARD = 1
 
 VOICE_MAX_LIMIT = 10
-VOICE_IDLE_SECONDS = 6 * 60 * 60  
+VOICE_IDLE_SECONDS = 6 * 60 * 60
 BLOCKED_WORDS: list[str] = [
     "Nigger",
     "Niger",
@@ -79,7 +111,7 @@ COLOR_ROLES = [
     ("Red", "Red"),
     ("Blue", "Blue"),
     ("Light Green", "Light Green"),
-    ("Beige", ("Beige", "Biege")),  
+    ("Beige", ("Beige", "Biege")),
     ("Green", "Green"),
     ("Pink", "Pink"),
     ("Orange", "Orange"),
@@ -111,7 +143,7 @@ class Database:
         if folder:
             os.makedirs(folder, exist_ok=True)
         self.conn = sqlite3.connect(path)
-        
+
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS settings (
@@ -120,7 +152,7 @@ class Database:
             )
             """
         )
-        
+
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -138,11 +170,11 @@ class Database:
             """
         )
         columns = {row[1] for row in self.conn.execute("PRAGMA table_info(users)")}
-        for column in ("mups", "vups", "xp_messages", "cookies_received", "cookies_given", 
+        for column in ("mups", "vups", "xp_messages", "cookies_received", "cookies_given",
                        "last_cookie_given", "tot_cooldown", "xp_buff_end"):
             if column not in columns:
                 self.conn.execute(f"ALTER TABLE users ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
-                
+
         if "xp_buff_value" not in columns:
             self.conn.execute("ALTER TABLE users ADD COLUMN xp_buff_value REAL NOT NULL DEFAULT 1.0")
 
@@ -172,21 +204,22 @@ class Database:
             (guild_id, user_id),
         )
 
-    def add_message(self, guild_id: int, user_id: int, pings: int, xp_gain: int, counted: bool = True, booster_mult: float = 1.0):
+    def add_message(self, guild_id: int, user_id: int, pings: int, xp_gain: int, counted: bool = True,
+                    booster_mult: float = 1.0, count_for_mups: bool = True):
         self._ensure(guild_id, user_id)
         old_xp, old_xp_messages = self.conn.execute(
             "SELECT xp, xp_messages FROM users WHERE guild_id = ? AND user_id = ?",
             (guild_id, user_id),
         ).fetchone()
-        
-        new_xp_messages = old_xp_messages + (1 if xp_gain > 0 else 0)
-        
+
+        new_xp_messages = old_xp_messages + (1 if (xp_gain > 0 and count_for_mups) else 0)
+
         cycles_old = old_xp_messages // MESSAGES_PER_MUPS
         cycles_new = new_xp_messages // MESSAGES_PER_MUPS
-        
+
         global_curr = float(self.get_setting("global_curr_mult", "1.0"))
         mups_gain = int((cycles_new - cycles_old) * MUPS_REWARD * booster_mult * global_curr)
-        
+
         self.conn.execute(
             "UPDATE users SET messages = messages + 1, pings = pings + ?, xp = xp + ?, "
             "xp_messages = ?, mups = mups + ? WHERE guild_id = ? AND user_id = ?",
@@ -195,18 +228,31 @@ class Database:
         self.conn.commit()
         return old_xp, old_xp + xp_gain, mups_gain
 
+    def add_xp(self, guild_id: int, user_id: int, amount: int):
+        """Add XP without counting a message (voice XP). Returns (old_xp, new_xp)."""
+        self._ensure(guild_id, user_id)
+        old_xp = self.conn.execute(
+            "SELECT xp FROM users WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+        ).fetchone()[0]
+        self.conn.execute(
+            "UPDATE users SET xp = xp + ? WHERE guild_id = ? AND user_id = ?",
+            (amount, guild_id, user_id),
+        )
+        self.conn.commit()
+        return old_xp, old_xp + amount
+
     def add_voice(self, guild_id: int, user_id: int, seconds: int, booster_mult: float = 1.0):
         self._ensure(guild_id, user_id)
         old_seconds = self.conn.execute(
             "SELECT voice_seconds FROM users WHERE guild_id = ? AND user_id = ?",
             (guild_id, user_id),
         ).fetchone()[0]
-        
+
         new_seconds = old_seconds + seconds
         global_curr = float(self.get_setting("global_curr_mult", "1.0"))
-        
+
         vups_gain = int((new_seconds // VOICE_SECONDS_PER_VUPS - old_seconds // VOICE_SECONDS_PER_VUPS) * VUPS_REWARD * booster_mult * global_curr)
-        
+
         self.conn.execute(
             "UPDATE users SET voice_seconds = ?, vups = vups + ? "
             "WHERE guild_id = ? AND user_id = ?",
@@ -222,7 +268,7 @@ class Database:
             (guild_id, user_id),
         ).fetchone()
         if row is None:
-            return {"xp": 0, "messages": 0, "pings": 0, "voice_seconds": 0, "mups": 0, "vups": 0, 
+            return {"xp": 0, "messages": 0, "pings": 0, "voice_seconds": 0, "mups": 0, "vups": 0,
                     "cookies_received": 0, "cookies_given": 0, "last_cookie_given": 0, "tot_cooldown": 0,
                     "xp_buff_end": 0, "xp_buff_value": 1.0}
         return {
@@ -235,6 +281,8 @@ class Database:
         return self.conn.execute("SELECT COUNT(*) + 1 FROM users WHERE guild_id = ? AND xp > ?", (guild_id, xp)).fetchone()[0]
 
     def top(self, guild_id: int, column: str, limit: int):
+        if column not in ("xp", "messages", "voice_seconds"):
+            raise ValueError("bad column")
         return self.conn.execute(
             f"SELECT user_id, xp, messages, voice_seconds FROM users WHERE guild_id = ? AND {column} > 0 ORDER BY {column} DESC LIMIT ?", (guild_id, limit)
         ).fetchall()
@@ -259,7 +307,7 @@ class Database:
         self._ensure(guild_id, user_id)
         self.conn.execute("UPDATE users SET mups = mups + ?, vups = vups + ? WHERE guild_id = ? AND user_id = ?", (mups, vups, guild_id, user_id))
         self.conn.commit()
-        
+
     def give_cookie(self, guild_id: int, giver_id: int, receiver_id: int, now: int):
         self._ensure(guild_id, giver_id)
         self._ensure(guild_id, receiver_id)
@@ -322,6 +370,11 @@ def progress_bar(current: int, total: int, length: int = 14) -> str:
     filled = int(length * current / total) if total else 0
     return "█" * filled + "░" * (length - filled)
 
+def progress_percent(current: int, total: int) -> int:
+    """Progress to the next level, rounded down to steps of 5 (exact XP numbers are hidden)."""
+    percent = int(100 * current / total) if total else 0
+    return percent - percent % 5
+
 def format_duration(seconds: int) -> str:
     minutes = seconds // 60
     hours, minutes = divmod(minutes, 60)
@@ -343,12 +396,42 @@ def is_blocked_name(name: str) -> bool:
 # ======================================================================
 #  Role helpers
 # ======================================================================
+def _norm_role(text: str) -> str:
+    """Lowercase letters and digits only: '🍁 MAPLE SYROUP 🍁' -> 'maplesyroup'."""
+    return re.sub(r"[\W_]+", "", text.lower())
+
 def find_role(guild: discord.Guild, name: str) -> discord.Role | None:
     lowered = name.lower()
     for role in guild.roles:
         if role.name.lower() == lowered: return role
     for role in guild.roles:
         if role.name.lower().startswith(lowered): return role
+    wanted = _norm_role(name)
+    if wanted:
+        for role in guild.roles:
+            if _norm_role(role.name) == wanted: return role
+    return None
+
+def level_role_set(guild: discord.Guild) -> set:
+    found = set()
+    for _, role_name in LEVEL_ROLES:
+        role = find_role(guild, role_name)
+        if role: found.add(role)
+    return found
+
+def find_shop_role(guild: discord.Guild, name: str) -> discord.Role | None:
+    """Like find_role, but never returns a level-reward role (so the shop can't sell them)."""
+    excluded = level_role_set(guild)
+    candidates = [r for r in guild.roles if r not in excluded]
+    lowered = name.lower()
+    for role in candidates:
+        if role.name.lower() == lowered: return role
+    for role in candidates:
+        if role.name.lower().startswith(lowered): return role
+    wanted = _norm_role(name)
+    if wanted:
+        for role in candidates:
+            if _norm_role(role.name) == wanted: return role
     return None
 
 async def get_role(guild: discord.Guild, name: str) -> discord.Role | None:
@@ -382,9 +465,28 @@ def find_channel_mention(guild: discord.Guild, keyword: str) -> str:
     return channel.mention if channel else f"#{keyword}"
 
 # ======================================================================
+#  Mod log (warnings for moderators)
+# ======================================================================
+def get_mod_log_channel(guild: discord.Guild):
+    if MOD_LOG_CHANNEL_ID:
+        channel = guild.get_channel(MOD_LOG_CHANNEL_ID)
+        if channel is not None: return channel
+    keywords = ("mod-log", "modlog", "moderator-only")
+    return discord.utils.find(
+        lambda c: isinstance(c, discord.TextChannel) and any(k in c.name.lower() for k in keywords),
+        guild.channels,
+    )
+
+async def mod_log(guild: discord.Guild, title: str, description: str):
+    channel = get_mod_log_channel(guild)
+    if channel is None: return
+    try: await channel.send(embed=discord.Embed(title=title, description=description, colour=PINK))
+    except (discord.Forbidden, discord.HTTPException): pass
+
+# ======================================================================
 #  Shop Data (Packs) - ALL 50% OFF
 # ======================================================================
-HALLOWEEN_EXPIRY = 1799020800  
+HALLOWEEN_EXPIRY = 1793750400   # 2026-11-04 00:00 UTC = the end of November 3
 
 SHOP_CATEGORIES = {
     "expie": {
@@ -508,18 +610,18 @@ class EmojiSelect(discord.ui.Select):
     def __init__(self, member: discord.Member, guild: discord.Guild):
         self.all_emoji_roles = []
         options = [discord.SelectOption(label="None", value="None")]
-        
+
         all_items = []
         for cat_data in SHOP_CATEGORIES.values():
             all_items.extend(cat_data["items"])
-            
+
         for item in all_items:
-            role = find_role(guild, item["role"])
+            role = find_shop_role(guild, item["role"])
             if role:
                 self.all_emoji_roles.append(role)
                 if role in member.roles:
                     options.append(discord.SelectOption(label=item["name"], value=str(role.id), default=True))
-        
+
         if len(options) == 1:
             options = [discord.SelectOption(label="You don't own any name emojis", value="None")]
             super().__init__(placeholder="Edit your Name emoji!", options=options, disabled=True, row=2)
@@ -542,7 +644,7 @@ class EmojiSelect(discord.ui.Select):
         except discord.Forbidden:
             await interaction.response.send_message("I don't have permission to change these roles.", ephemeral=True)
             return
-        
+
         for option in self.options: option.default = (option.value == val)
         await interaction.response.edit_message(content="Saved! Name emoji updated.", view=self.view)
 
@@ -590,7 +692,7 @@ class EditProfilePanel(discord.ui.View):
             if role: pronoun_group[label] = role
         if len(pronoun_group) > 1:
             self.add_item(RoleGroupSelect(member, pronoun_group, "Edit your pronouns!", True, 1))
-            
+
         self.add_item(EmojiSelect(member, guild))
         self.add_item(EditNameButton())
 
@@ -812,13 +914,21 @@ class SillyBot(discord.Client):
 
 client = SillyBot()
 
-last_xp_time: dict[tuple[int, int], float] = {}
-recent_messages: dict[tuple[int, int], deque] = {}
-xp_timestamps: dict[tuple[int, int], deque] = {}
+# ======================================================================
+#  XP engine
+# ======================================================================
+next_xp_time: dict[tuple[int, int], float] = {}                  # earliest time of the next XP gain
+recent_messages: dict[tuple[int, int], deque] = {}               # for the "similar message" filter
+xp_timestamps: dict[tuple[int, int], deque] = {}                 # XP gains in the last hour (fatigue)
+channel_activity: dict[int, deque] = {}                          # channel -> (time, author) of recent messages
+message_times: dict[tuple[int, int], deque] = {}                 # last message times (mechanical detector)
+suspicious_until: dict[tuple[int, int], float] = {}              # reduced XP until this time
 
 URL_RE = re.compile(r"https?://\S+")
-DISCORD_TAG_RE = re.compile(r"<a?:\w+:\d+>|<[@#][!&]?\d+>")  
+DISCORD_TAG_RE = re.compile(r"<a?:\w+:\d+>|<[@#][!&]?\d+>")
+WORD_RE = re.compile(r"[^\W\d_]+")
 
+# --- xp engine helpers (pure functions) ---
 def letters_only(text: str) -> str:
     text = URL_RE.sub("", text)
     text = DISCORD_TAG_RE.sub("", text)
@@ -833,6 +943,41 @@ def is_real_message(key: tuple[int, int], content: str) -> bool:
     history.append(letters)
     return True
 
+def unique_word_count(text: str) -> int:
+    text = URL_RE.sub(" ", text)
+    text = DISCORD_TAG_RE.sub(" ", text)
+    return len(set(WORD_RE.findall(text.lower())))
+
+def quality_multiplier(unique_words: int) -> float:
+    """C: more different words = more XP. Repeating one word gives very little."""
+    if unique_words <= 1: return SINGLE_WORD_MULT
+    if unique_words <= 3: return SHORT_MULT
+    if unique_words <= 9: return 1.0
+    return LONG_MULT
+
+def fatigue_multiplier(gains_last_hour: int) -> float:
+    """B: smooth slowdown instead of a hard wall."""
+    for limit, mult in FATIGUE_STEPS:
+        if gains_last_hour < limit: return mult
+    return FATIGUE_STEPS[-1][1]
+
+def has_company(channel_id: int, author_id: int, now: float) -> bool:
+    """D: did someone else write in this channel recently?"""
+    recent = channel_activity.get(channel_id)
+    if not recent: return False
+    return any(author != author_id and now - when <= COMPANY_WINDOW for when, author in recent)
+
+def looks_mechanical(key: tuple[int, int], now: float) -> bool:
+    """E: messages arriving at suspiciously even intervals (scripts, macros)."""
+    times = message_times.setdefault(key, deque(maxlen=MECH_MESSAGES))
+    times.append(now)
+    if len(times) < MECH_MESSAGES: return False
+    ordered = list(times)
+    gaps = [b - a for a, b in zip(ordered, ordered[1:])]
+    return min(gaps) >= MECH_MIN_GAP and (max(gaps) - min(gaps)) <= MECH_TOLERANCE
+# --- end xp engine helpers ---
+
+
 # ======================================================================
 #  Background tasks
 # ======================================================================
@@ -840,18 +985,36 @@ def is_real_message(key: tuple[int, int], content: str) -> bool:
 async def voice_tracker():
     guild = client.get_guild(GUILD_ID)
     if guild is None: return
+    global_xp = float(db.get_setting("global_xp_mult", "1.0"))
+    voice_xp = int(VOICE_XP_PER_MINUTE * global_xp)
+
     for channel in guild.voice_channels + guild.stage_channels:
         if channel == guild.afk_channel: continue
         humans = [m for m in channel.members if not m.bot]
-        if len(humans) < 2: continue
-        for member in humans:
-            state = member.voice
-            if state is None or state.channel != channel: continue
-            if state.deaf or state.self_deaf: continue
-            
+        # G: only count people who can actually hear, and need at least 2 of them
+        listeners = [
+            m for m in humans
+            if m.voice is not None and m.voice.channel == channel and not (m.voice.deaf or m.voice.self_deaf)
+        ]
+        if len(listeners) < 2: continue
+
+        for member in listeners:
             has_booster = any("CERTIFIED PAWBOOSTER" in r.name.upper() for r in member.roles)
             booster_mult = 1.5 if has_booster else 1.0
             db.add_voice(guild.id, member.id, int(60 * booster_mult))
+
+            if voice_xp > 0:
+                old_xp, new_xp = db.add_xp(guild.id, member.id, voice_xp)
+                old_level = level_from_xp(old_xp)[0]
+                new_level = level_from_xp(new_xp)[0]
+                if new_level > old_level:
+                    granted = await sync_level_roles(member, new_level)
+                    text = f"{member.mention} just reached **level {new_level}**!"
+                    if granted:
+                        names = ", ".join(f"**{role.name}**" for role in granted)
+                        text += f" New role unlocked: {names}"
+                    try: await channel.send(text)
+                    except (discord.Forbidden, discord.HTTPException, AttributeError): pass
 
 @voice_tracker.before_loop
 async def before_voice_tracker():
@@ -912,42 +1075,80 @@ async def on_message(message: discord.Message):
     member = message.author
     pings = len({m.id for m in message.mentions if not m.bot and m.id != member.id})
     key = (message.guild.id, member.id)
+    now_f = time.time()
+    now = int(now_f)
+
+    # --- context about this message ---
+    company = has_company(message.channel.id, member.id, now_f)
+
+    replied_to_human = False
+    reference = message.reference
+    if reference is not None and isinstance(reference.resolved, discord.Message):
+        original_author = reference.resolved.author
+        if original_author.id != member.id and not original_author.bot:
+            replied_to_human = True
+            company = True   # answering someone counts as talking together
+
+    # E: scripts and macros send messages at very even intervals
+    if looks_mechanical(key, now_f) and now_f >= suspicious_until.get(key, 0):
+        suspicious_until[key] = now_f + SUSPICIOUS_SECONDS
+        await mod_log(
+            message.guild,
+            "Suspicious message timing",
+            f"{member.mention} in {message.channel.mention} sends messages at very even intervals. "
+            f"Their XP is reduced for {SUSPICIOUS_SECONDS // 60} minutes.",
+        )
+
+    channel_activity.setdefault(message.channel.id, deque(maxlen=30)).append((now_f, member.id))
+
     counted = is_real_message(key, message.content)
 
-    now = int(time.time())
+    # --- XP ---
     gain = 0
-    
-    if counted and now - last_xp_time.get(key, 0) >= XP_COOLDOWN:
+    count_for_mups = False
+    if counted and now_f >= next_xp_time.get(key, 0):
         history = xp_timestamps.setdefault(key, deque())
         while history and now - history[0] > 3600:
             history.popleft()
-            
-        if len(history) < MAX_XP_PER_HOUR:
-            data = db.get(message.guild.id, member.id)
-            current_level = level_from_xp(data["xp"])[0]
-            
-            base_gain = random.randint(XP_MIN, XP_MAX)
-            level_bonus = int(current_level * 0.5) 
-            gain = base_gain + level_bonus
-            
-            # Global / TrickOrTreat Multipliers
-            global_xp = float(db.get_setting("global_xp_mult", "1.0"))
-            tot_xp_buff = 1.0
-            if now < data.get("xp_buff_end", 0):
-                tot_xp_buff = data.get("xp_buff_value", 1.0)
-                
-            gain = int(gain * global_xp * tot_xp_buff)
-            
-            last_xp_time[key] = now
-            history.append(now)
+        gains_last_hour = len(history)
+
+        data = db.get(message.guild.id, member.id)
+        current_level = level_from_xp(data["xp"])[0]
+
+        quality = quality_multiplier(unique_word_count(message.content))
+        fatigue = fatigue_multiplier(gains_last_hour)
+        company_mult = 1.0 if company else SOLO_MULTIPLIER
+        suspicious_mult = SUSPICIOUS_MULTIPLIER if now_f < suspicious_until.get(key, 0) else 1.0
+        reply_mult = REPLY_BONUS if replied_to_human else 1.0
+
+        base_gain = random.randint(XP_MIN, XP_MAX)
+        level_bonus = int(current_level * 0.5)
+
+        # Global / TrickOrTreat Multipliers
+        global_xp = float(db.get_setting("global_xp_mult", "1.0"))
+        tot_xp_buff = 1.0
+        if now < data.get("xp_buff_end", 0):
+            tot_xp_buff = data.get("xp_buff_value", 1.0)
+
+        gain = int((base_gain + level_bonus) * quality * fatigue * company_mult * suspicious_mult * reply_mult * global_xp * tot_xp_buff)
+        gain = max(1, gain)
+
+        # Mups only for real conversation, and only for the first gains of each hour
+        count_for_mups = (
+            quality >= SHORT_MULT and company and suspicious_mult == 1.0
+            and gains_last_hour < MUPS_ELIGIBLE_PER_HOUR
+        )
+
+        next_xp_time[key] = now_f + random.uniform(*XP_COOLDOWN_RANGE)
+        history.append(now)
 
     has_booster = any("CERTIFIED PAWBOOSTER" in r.name.upper() for r in member.roles)
     booster_mult = 1.5 if has_booster else 1.0
 
-    old_xp, new_xp, _mups = db.add_message(message.guild.id, member.id, pings, gain, counted, booster_mult)
+    old_xp, new_xp, _mups = db.add_message(message.guild.id, member.id, pings, gain, counted, booster_mult, count_for_mups)
     old_level = level_from_xp(old_xp)[0]
     new_level = level_from_xp(new_xp)[0]
-    
+
     if new_level > old_level:
         granted = await sync_level_roles(member, new_level)
         text = f"{member.mention} just reached **level {new_level}**!"
@@ -993,27 +1194,27 @@ async def profile(interaction: discord.Interaction, member: discord.Member | Non
     next_reward = "All roles unlocked"
     for required_level, role_name in LEVEL_ROLES:
         if level < required_level:
-            next_reward = f"{role_name} at level {required_level}"
+            next_reward = f"{role_name.rstrip('.')} at level {required_level}"
             break
 
     colour = target_member.colour if target_member.colour.value else PINK
     embed = discord.Embed(
         title=f"{target_member.display_name}'s profile",
-        description=f"**Level {level}**  |  Rank **#{rank}**\n`{progress_bar(into_level, needed)}`  {into_level:,} / {needed:,} XP",
+        description=f"**Level {level}**  |  Rank **#{rank}**\n`{progress_bar(into_level, needed)}`  {progress_percent(into_level, needed)}% to the next level",
         colour=colour,
     )
     embed.set_thumbnail(url=target_member.display_avatar.url)
-    
+
     embed.add_field(name="Mups", value=f"{data['mups']:,}", inline=True)
     embed.add_field(name="Vups", value=f"{data['vups']:,}", inline=True)
     embed.add_field(name="Cookies", value=f"🍪 {data['cookies_received']:,}", inline=True)
-    
+
     embed.add_field(name="Messages sent", value=f"{data['messages']:,}", inline=True)
     embed.add_field(name="Pings sent", value=f"{data['pings']:,}", inline=True)
     embed.add_field(name="Time in voice", value=format_duration(data["voice_seconds"]), inline=True)
-    
+
     embed.add_field(name="Next reward", value=next_reward, inline=False)
-    embed.set_footer(text=f"Total XP: {data['xp']:,}")
+    embed.set_footer(text="Keep chatting and be silly :3")
 
     if target_member.id == interaction.user.id:
         view = ProfileView(target_member)
@@ -1027,21 +1228,22 @@ async def profile(interaction: discord.Interaction, member: discord.Member | Non
 async def progress(interaction: discord.Interaction):
     data = db.get(interaction.guild.id, interaction.user.id)
     current_level, into_level, needed = level_from_xp(data["xp"])
-    
+
     lines = []
     next_found = False
     for req_level, role_name in LEVEL_ROLES:
+        shown = role_name.rstrip(".")
         if current_level >= req_level:
-            lines.append(f"✅ **Level {req_level}:** {role_name} *(Unlocked!)*")
+            lines.append(f"✅ **Level {req_level}:** {shown} *(Unlocked!)*")
         elif not next_found:
-            lines.append(f"🔄 **Level {req_level}:** {role_name} *(Next!)*")
+            lines.append(f"🔄 **Level {req_level}:** {shown} *(Next!)*")
             next_found = True
         else:
-            lines.append(f"🔒 **Level {req_level}:** {role_name}")
-            
+            lines.append(f"🔒 **Level {req_level}:** {shown}")
+
     embed = discord.Embed(
         title="📈 Your Level Progress",
-        description=f"**Current Level: {current_level}**\n`{progress_bar(into_level, needed)}` {into_level:,} / {needed:,} XP\n\n**Role Unlocks:**\n" + "\n".join(lines),
+        description=f"**Current Level: {current_level}**\n`{progress_bar(into_level, needed)}` {progress_percent(into_level, needed)}% to the next level\n\n**Role Unlocks:**\n" + "\n".join(lines),
         colour=PINK
     )
     await interaction.response.send_message(embed=embed)
@@ -1049,12 +1251,12 @@ async def progress(interaction: discord.Interaction):
 
 def build_leaderboard_embed(guild: discord.Guild, kind: str) -> discord.Embed:
     titles = {"xp": "Top levels", "messages": "Top chatters", "voice_seconds": "Top voice time"}
-    rows = db.top(guild.id, kind, 50)  
+    rows = db.top(guild.id, kind, 50)
     lines = []
     for user_id, xp, messages, voice_seconds in rows:
         member = guild.get_member(user_id)
         if member is None: continue
-        if kind == "xp": value = f"Level {level_from_xp(xp)[0]} | {xp:,} XP"
+        if kind == "xp": value = f"Level {level_from_xp(xp)[0]}"
         elif kind == "messages": value = f"{messages:,} messages"
         else: value = format_duration(voice_seconds)
         lines.append(f"**#{len(lines) + 1}** {member.display_name} | {value}")
@@ -1099,34 +1301,34 @@ async def currencyleaderboard(interaction: discord.Interaction):
 @app_commands.guild_only()
 async def award_cookie(interaction: discord.Interaction, user: discord.Member):
     giver = interaction.user
-    
+
     if user.id == giver.id:
         await interaction.response.send_message("You can't give a cookie to yourself! Share with others :3", ephemeral=True)
         return
     if user.bot:
         await interaction.response.send_message("Bots don't eat cookies, they eat RAM! Pick a real person.", ephemeral=True)
         return
-        
+
     guild_id = interaction.guild.id
     data = db.get(guild_id, giver.id)
-    
+
     has_booster = any("CERTIFIED PAWBOOSTER" in r.name.upper() for r in giver.roles)
     base_cooldown = 24 * 60 * 60
     cooldown = int(base_cooldown * 0.8) if has_booster else base_cooldown
-    
+
     now = int(time.time())
     last_given = data.get("last_cookie_given", 0)
-    
+
     if now - last_given < cooldown:
         remaining = cooldown - (now - last_given)
         hours, remainder = divmod(remaining, 3600)
         minutes, _ = divmod(remainder, 60)
         await interaction.response.send_message(
-            f"You already gave a cookie! You can give another one in {hours}h {minutes}m.", 
+            f"You already gave a cookie! You can give another one in {hours}h {minutes}m.",
             ephemeral=True
         )
         return
-        
+
     db.give_cookie(guild_id, giver.id, user.id, now)
     await interaction.response.send_message(f"🍪 {giver.mention} gave a delicious cookie to {user.mention}! So sweet :3")
 
@@ -1137,7 +1339,7 @@ async def my_cookies(interaction: discord.Interaction):
     data = db.get(interaction.guild.id, interaction.user.id)
     received = data.get("cookies_received", 0)
     given = data.get("cookies_given", 0)
-    
+
     embed = discord.Embed(
         title=f"🍪 {interaction.user.display_name}'s Cookie Jar",
         description=f"**Cookies received:** {received}\n**Cookies given:** {given}",
@@ -1154,25 +1356,25 @@ async def my_cookies(interaction: discord.Interaction):
 async def trick_or_treat(interaction: discord.Interaction):
     user_id = interaction.user.id
     guild_id = interaction.guild.id
-    
+
     data = db.get(guild_id, user_id)
     now = int(time.time())
     last_tot = data.get("tot_cooldown", 0)
-    
+
     if now - last_tot < 600:
         rem = 600 - (now - last_tot)
         m, s = divmod(rem, 60)
         await interaction.response.send_message(f"You can play again in {m}m {s}s!", ephemeral=True)
         return
-        
+
     db.set_tot_cooldown(guild_id, user_id, now)
-    
+
     is_treat = random.choice([True, False])
     outcome = random.randint(1, 7)
-    
+
     title_text = "Treat" if is_treat else "Trick"
     msg = ""
-    
+
     if is_treat:
         if outcome == 1:
             currency = random.choice(["Mups", "Vups"])
@@ -1180,29 +1382,30 @@ async def trick_or_treat(interaction: discord.Interaction):
             if currency == "Mups": db.add_currency(guild_id, user_id, amount, 0)
             else: db.add_currency(guild_id, user_id, 0, amount)
             msg = f"Jackpot!!! You got {amount} {currency}"
-            
+
         elif outcome == 2:
             amount = random.randint(1, 3)
             db.conn.execute("UPDATE users SET cookies_received = cookies_received + ? WHERE guild_id = ? AND user_id = ?", (amount, guild_id, user_id))
             db.conn.commit()
             msg = f"Yummy! you got {amount} cookies!🍪"
-            
+
         elif outcome == 3:
             db.set_xp_buff(guild_id, user_id, now + 86400, 3.0)
             msg = "WOAAHHWW!!! You get a HUGE x3 XP Boost for the next 24 hours! Great luck ^^"
-            
+
         elif outcome == 4:
             current_lvl, _, _ = level_from_xp(data["xp"])
             next_lvl_xp = xp_for_level(current_lvl + 1)
             db.conn.execute("UPDATE users SET xp = ? WHERE guild_id = ? AND user_id = ?", (next_lvl_xp, guild_id, user_id))
             db.conn.commit()
             msg = "You got +1 lvl! Congradulations, gambler!"
-            
+            await sync_level_roles(interaction.user, current_lvl + 1)
+
         elif outcome == 5:
             all_shop_roles = [item["role"] for cat in SHOP_CATEGORIES.values() for item in cat["items"]]
             unowned = []
             for r_name in all_shop_roles:
-                r = find_role(interaction.guild, r_name)
+                r = find_shop_role(interaction.guild, r_name)
                 if r and r not in interaction.user.roles:
                     unowned.append((r, r_name))
             if unowned:
@@ -1210,25 +1413,27 @@ async def trick_or_treat(interaction: discord.Interaction):
                 try:
                     await interaction.user.add_roles(role_obj, reason="Trick or Treat")
                     msg = f"Cat gave you the {r_name} item.. It's yours now!"
-                except:
-                    msg = "A cat tried to bring smt, but you own all of them..."
+                except (discord.Forbidden, discord.HTTPException):
+                    msg = "A cat tried to bring smt, but I can't give you roles right now..."
             else:
                 msg = "A cat tried to bring smt, but you own all of them..."
-                
+
         elif outcome == 6:
             role = await get_role(interaction.guild, "Pumpkin Pie")
             if role:
                 try:
                     await interaction.user.add_roles(role, reason="Trick or Treat")
                     msg = "YESS.. I HIT THE LIMITED THING! You unlocked the exclusive Pumpkin Pie name color"
-                except:
+                except (discord.Forbidden, discord.HTTPException):
                     msg = "YESS.. but I don't have permissions to give you the role!"
-                    
+            else:
+                msg = "YESS.. but I couldn't find the Pumpkin Pie role!"
+
         elif outcome == 7:
             db.set_xp_buff(guild_id, user_id, now + 86400, 1.4)
             msg = "HEAVENLY LUCK FOR A BUFF! You will earn +40% MORE XP for the next 24 hours! "
-            
-    else: # TRICK
+
+    else:  # TRICK
         if outcome == 1:
             currency = random.choice(["Mups", "Vups"])
             if currency == "Mups":
@@ -1239,7 +1444,7 @@ async def trick_or_treat(interaction: discord.Interaction):
                 db.conn.execute("UPDATE users SET vups = MAX(0, vups - ?) WHERE guild_id = ? AND user_id = ?", (amount, guild_id, user_id))
             db.conn.commit()
             msg = f"GUHH! A mischievous cat stole {amount} {currency} from you ~w~!"
-            
+
         elif outcome == 2:
             current_lvl, _, _ = level_from_xp(data["xp"])
             new_lvl = max(0, current_lvl - 1)
@@ -1247,19 +1452,19 @@ async def trick_or_treat(interaction: discord.Interaction):
             db.conn.execute("UPDATE users SET xp = ? WHERE guild_id = ? AND user_id = ?", (new_xp, guild_id, user_id))
             db.conn.commit()
             msg = "You lost 1 lvl! not cool.. not cool"
-            
+
         elif outcome == 3:
             try:
                 await interaction.user.timeout(discord.utils.utcnow() + datetime.timedelta(minutes=5), reason="Trick or Treat Trick")
                 msg = "You were SILENCED! Time outed for 5 mins"
-            except:
+            except (discord.Forbidden, discord.HTTPException):
                 msg = "You were SILENCED! (Wait, I don't have permissions to timeout you...)"
-                
+
         elif outcome == 4:
             db.conn.execute("UPDATE users SET xp = MAX(0, xp - 200) WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
             db.conn.commit()
             msg = "You lost 200 xp, bad luck!"
-            
+
         elif outcome == 5:
             current_lvl, _, _ = level_from_xp(data["xp"])
             new_lvl = max(0, current_lvl - 2)
@@ -1267,12 +1472,12 @@ async def trick_or_treat(interaction: discord.Interaction):
             db.conn.execute("UPDATE users SET xp = ? WHERE guild_id = ? AND user_id = ?", (new_xp, guild_id, user_id))
             db.conn.commit()
             msg = "You lost 2 lvls! This really not cool!!"
-            
+
         elif outcome == 6:
             all_shop_roles = [item["role"] for cat in SHOP_CATEGORIES.values() for item in cat["items"]]
             owned = []
             for r_name in all_shop_roles:
-                r = find_role(interaction.guild, r_name)
+                r = find_shop_role(interaction.guild, r_name)
                 if r and r in interaction.user.roles:
                     owned.append((r, r_name))
             if owned:
@@ -1280,21 +1485,16 @@ async def trick_or_treat(interaction: discord.Interaction):
                 try:
                     await interaction.user.remove_roles(role_obj, reason="Trick or Treat Trick")
                     msg = f"Someone stole {r_name} from your inventory!"
-                except:
+                except (discord.Forbidden, discord.HTTPException):
                     msg = "Guhh.. I wanted ur items but you got nothing.. ~w~"
             else:
                 msg = "Guhh.. I wanted ur items but you got nothing.. ~w~"
-                
+
         elif outcome == 7:
             db.set_xp_buff(guild_id, user_id, now + 86400, 0.95)
             msg = "You ate a cursed candy! You will earn 5% less XP for the next 24 hours..."
 
-    # Formatting exactly as requested
-    final_message = f"{title_text} / Treat\n\n{msg}" if not is_treat else f"Trick / {title_text}\n\n{msg}"
-    
-    # Just to be 100% exact to the prompt: "Trick / Treat \n\n Message.."
-    final_message = f"{title_text}\n\n{msg}"
-    await interaction.response.send_message(final_message)
+    await interaction.response.send_message(f"{title_text}\n\n{msg}")
 
 
 # ======================================================================
@@ -1321,14 +1521,14 @@ class ShopCategorySelect(discord.ui.Select):
             flag_text = f" ({category['flag']})" if category.get("flag") else ""
             item_count = len(category["items"])
             item_text = f"{item_count} item{'s' if item_count != 1 else ''}"
-            
+
             options.append(discord.SelectOption(
-                label=category["label"], 
-                value=key, 
+                label=category["label"],
+                value=key,
                 description=f"{flag_text} {item_text}".strip(),
                 default=(key == shop.category)
             ))
-            
+
         super().__init__(placeholder="Choose a pack!", options=options, row=0)
         self.shop = shop
 
@@ -1370,7 +1570,7 @@ class ShopBuyButton(discord.ui.Button):
 
         guild = interaction.guild
         member = interaction.user
-        role = find_role(guild, item["role"])
+        role = find_shop_role(guild, item["role"])
         if role is None:
             await interaction.response.send_message("I can't find that role right now. Please tell a mod.", ephemeral=True)
             return
@@ -1449,12 +1649,12 @@ class ShopView(discord.ui.View):
                 if category["items"]: body = "\n\n".join(shop_item_text(guild, item) for item in category["items"])
                 else: body = SHOP_EMPTY_TEXT
                 text = f"{self.notice}\n\n{body}" if self.notice else body
-                
+
                 flag_text = f" [{category['flag']}]" if category.get("flag") else ""
                 embed = discord.Embed(title=f"{category['label']}{flag_text}", description=text, colour=CREAM)
             else:
                 embed = discord.Embed(title="Error", description="This pack is no longer available.", colour=CREAM)
-                
+
         embed.add_field(name="Your Mups", value=f"{data['mups']:,}", inline=True)
         embed.add_field(name="Your Vups", value=f"{data['vups']:,}", inline=True)
         return embed
@@ -1555,8 +1755,8 @@ async def test_welcome(interaction: discord.Interaction):
 # ======================================================================
 #  Hug and pat
 # ======================================================================
-ACTION_COOLDOWN = 15        
-ACTION_REPLY_SECONDS = 10   
+ACTION_COOLDOWN = 15
+ACTION_REPLY_SECONDS = 10
 
 PAT_GIFS: list[str] = [
     "https://media1.tenor.com/m/la-8MgilWWAAAAAC/furry-furry-cuddle.gif",

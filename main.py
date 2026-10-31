@@ -1552,175 +1552,6 @@ async def trick_or_treat(interaction: discord.Interaction):
 
 
 # ======================================================================
-#  Shop Command
-# ======================================================================
-SHOP_EMPTY_TEXT = "There is nothing right now! Sowwee ~w~"
-
-def find_emoji(guild: discord.Guild, name: str) -> discord.Emoji | None:
-    lowered = name.lower()
-    for emoji in guild.emojis:
-        if emoji.name.lower() == lowered: return emoji
-    return None
-
-def shop_item_text(guild: discord.Guild, item: dict) -> str:
-    emoji = find_emoji(guild, item["emoji"])
-    icon = f" {emoji}" if emoji else ""
-    return f"**@Nickname{icon} — {item['name']}!**\n{item['description']}\nPrice: {item['mups']} Mups | {item['vups']} Vups"
-
-class ShopCategorySelect(discord.ui.Select):
-    def __init__(self, shop: "ShopView"):
-        active_categories = get_active_shop_categories()
-        options = []
-        for key, category in active_categories.items():
-            flag_text = f" ({category['flag']})" if category.get("flag") else ""
-            item_count = len(category["items"])
-            item_text = f"{item_count} item{'s' if item_count != 1 else ''}"
-
-            options.append(discord.SelectOption(
-                label=category["label"],
-                value=key,
-                description=f"{flag_text} {item_text}".strip(),
-                default=(key == shop.category)
-            ))
-
-        super().__init__(placeholder="Choose a pack!", options=options, row=0)
-        self.shop = shop
-
-    async def callback(self, interaction: discord.Interaction):
-        self.shop.category = self.values[0]
-        self.shop.selected = None
-        self.shop.notice = None
-        self.shop.build()
-        await interaction.response.edit_message(embed=self.shop.make_embed(), view=self.shop)
-
-class ShopItemSelect(discord.ui.Select):
-    def __init__(self, shop: "ShopView"):
-        guild = shop.member.guild
-        options = [
-            discord.SelectOption(
-                label=item["name"], value=item["key"], description=f"{item['mups']} Mups | {item['vups']} Vups",
-                emoji=find_emoji(guild, item["emoji"]), default=(item["key"] == shop.selected)
-            ) for item in shop.items()
-        ]
-        super().__init__(placeholder="Choose what to buy!", options=options, row=1)
-        self.shop = shop
-
-    async def callback(self, interaction: discord.Interaction):
-        self.shop.selected = self.values[0]
-        self.shop.build()
-        await interaction.response.edit_message(embed=self.shop.make_embed(), view=self.shop)
-
-class ShopBuyButton(discord.ui.Button):
-    def __init__(self, shop: "ShopView"):
-        super().__init__(label="Buy", style=discord.ButtonStyle.success, row=2)
-        self.shop = shop
-
-    async def callback(self, interaction: discord.Interaction):
-        shop = self.shop
-        item = shop.selected_item()
-        if item is None:
-            await interaction.response.send_message("Pick something to buy first.", ephemeral=True)
-            return
-
-        guild = interaction.guild
-        member = interaction.user
-        role = find_shop_role(guild, item["role"])
-        if role is None:
-            await interaction.response.send_message("I can't find that role right now. Please tell a mod.", ephemeral=True)
-            return
-        if role in member.roles:
-            await interaction.response.send_message("You already own this one.", ephemeral=True)
-            return
-
-        data = db.get(guild.id, member.id)
-        missing_mups = max(0, item["mups"] - data["mups"])
-        missing_vups = max(0, item["vups"] - data["vups"])
-        if missing_mups or missing_vups:
-            parts = []
-            if missing_mups: parts.append(f"{missing_mups} more Mups")
-            if missing_vups: parts.append(f"{missing_vups} more Vups")
-            await interaction.response.send_message(f"You need {' and '.join(parts)}.", ephemeral=True)
-            return
-
-        if not db.spend(guild.id, member.id, item["mups"], item["vups"]):
-            await interaction.response.send_message("You don't have enough for that.", ephemeral=True)
-            return
-
-        try: await member.add_roles(role, reason=f"Bought in the shop: {item['name']}")
-        except (discord.Forbidden, discord.HTTPException):
-            db.refund(guild.id, member.id, item["mups"], item["vups"])
-            await interaction.response.send_message("I can't give you that role. Please tell a mod to move my role higher.", ephemeral=True)
-            return
-
-        shop.notice = f"You bought {item['name']}!"
-        shop.selected = None
-        shop.build()
-        await interaction.response.edit_message(embed=shop.make_embed(), view=shop)
-
-class ShopView(discord.ui.View):
-    def __init__(self, member: discord.Member):
-        super().__init__(timeout=600)
-        self.member = member
-        self.category: str | None = None
-        self.selected: str | None = None
-        self.notice: str | None = None
-        self.build()
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.member.id: return True
-        await interaction.response.send_message("This is not your shop! Type /shop to open your own.", ephemeral=True)
-        return False
-
-    def items(self) -> list[dict]:
-        if self.category is None: return []
-        active_categories = get_active_shop_categories()
-        if self.category not in active_categories: return []
-        return active_categories[self.category]["items"]
-
-    def selected_item(self) -> dict | None:
-        for item in self.items():
-            if item["key"] == self.selected: return item
-        return None
-
-    def build(self):
-        self.clear_items()
-        self.add_item(ShopCategorySelect(self))
-        if self.items():
-            self.add_item(ShopItemSelect(self))
-            self.add_item(ShopBuyButton(self))
-
-    def make_embed(self) -> discord.Embed:
-        guild = self.member.guild
-        data = db.get(guild.id, self.member.id)
-        if self.category is None:
-            desc = "Welcome in! Pick a pack below to see what's on the shelves.\n\n✨ **NEW:** Expie Pack, just arrived!\n🎃 **LIMITED:** Halloween Pack, available until Nov 3!"
-            embed = discord.Embed(title="Silly Shop", description=desc, colour=CREAM)
-            embed.set_footer(text="Boosters get 1.5x Mups and Vups!")
-        else:
-            active_categories = get_active_shop_categories()
-            if self.category in active_categories:
-                category = active_categories[self.category]
-                if category["items"]: body = "\n\n".join(shop_item_text(guild, item) for item in category["items"])
-                else: body = SHOP_EMPTY_TEXT
-                text = f"{self.notice}\n\n{body}" if self.notice else body
-
-                flag_text = f" [{category['flag']}]" if category.get("flag") else ""
-                embed = discord.Embed(title=f"{category['label']}{flag_text}", description=text, colour=CREAM)
-            else:
-                embed = discord.Embed(title="Error", description="This pack is no longer available.", colour=CREAM)
-
-        embed.add_field(name="Your Mups", value=f"{data['mups']:,}", inline=True)
-        embed.add_field(name="Your Vups", value=f"{data['vups']:,}", inline=True)
-        return embed
-
-@client.tree.command(name="shop", description="Visit the shop")
-@app_commands.guild_only()
-async def shop(interaction: discord.Interaction):
-    view = ShopView(interaction.user)
-    await interaction.response.send_message(embed=view.make_embed(), view=view)
-
-
-# ======================================================================
 #  Admin commands (Setup & Give Currency & Global Multipliers)
 # ======================================================================
 @client.tree.command(name="event_2x_xp", description="Toggle global 2x XP (Admins only)")
@@ -1802,6 +1633,45 @@ async def give_lvl(interaction: discord.Interaction, user: discord.Member, amoun
 
 client.tree.add_command(give_group)
 
+@client.tree.command(name="remove_lvl", description="Remove levels from a user (admins only)")
+@app_commands.describe(user="Who loses the levels", amount="How many levels to remove (default 1)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def remove_lvl(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1, 200] = 1):
+    if not is_server_admin(interaction):
+        await interaction.response.send_message("Only the server creator or admins can do this.", ephemeral=True)
+        return
+    if user.bot:
+        await interaction.response.send_message("Bots don't have levels.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = interaction.guild.id
+    current_xp = db.get(guild_id, user.id)["xp"]
+    old_level = level_from_xp(current_xp)[0]
+    
+    new_level = max(0, old_level - amount)
+    new_xp = xp_for_level(new_level)
+    
+    db.conn.execute("UPDATE users SET xp = ? WHERE guild_id = ? AND user_id = ?", (new_xp, guild_id, user.id))
+    db.conn.commit()
+
+    removed_roles = []
+    for req_level, role_name in LEVEL_ROLES:
+        if req_level > new_level:
+            role = find_role(interaction.guild, role_name)
+            if role and role in user.roles:
+                try:
+                    await user.remove_roles(role, reason=f"Level removed by admin")
+                    removed_roles.append(role)
+                except discord.Forbidden:
+                    pass
+
+    text = f"Removed {amount} level{'s' if amount != 1 else ''} from {user.mention}: level {old_level} -> level {new_level}."
+    if removed_roles:
+        text += " Roles removed: " + ", ".join(f"**{role.name}**" for role in removed_roles)
+    await interaction.followup.send(text, ephemeral=True)
 
 @client.tree.command(name="setup_verify", description="Post the verification message (admins only)")
 @app_commands.default_permissions(administrator=True)

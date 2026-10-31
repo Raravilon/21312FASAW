@@ -20,17 +20,11 @@ GUILD_ID = int(os.getenv("GUILD_ID", "1564401949019869224"))
 WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", "1564405099004956702"))
 VERIFY_CHANNEL_ID = int(os.getenv("VERIFY_CHANNEL_ID", "1564405761105461379"))
 
-# Optional: channel for bot warnings to moderators (0 = look for a channel
-# named "mod-log" or "moderator-only")
 MOD_LOG_CHANNEL_ID = int(os.getenv("MOD_LOG_CHANNEL_ID", "0"))
 
 JOINED_ROLE_NAME = os.getenv("JOINED_ROLE_NAME", "Just joined!")
 NEWCOMER_ROLE_NAME = os.getenv("NEWCOMER_ROLE_NAME", "Newcomer :3")
 
-# Level rewards. Names are matched ignoring case, emojis and punctuation, so
-# "MAPLE SYROUP" finds "🍁 MAPLE SYROUP 🍁".
-# IMPORTANT: the level-85 role is "Maplet..........." (with dots). It is looked up as
-# "Maplet..." so it can never be confused with the shop role called just "Maplet".
 LEVEL_ROLES = [
     (3, "Silly Critter"),
     (10, "Friendly"),
@@ -45,39 +39,34 @@ LEVEL_ROLES = [
 # ----------------------------------------------------------------------
 XP_MIN = 20
 XP_MAX = 35
-XP_COOLDOWN_RANGE = (15, 40)    # random seconds between two XP gains (hidden from players)
+XP_COOLDOWN_RANGE = (10, 12)    # Very fast, stable cooldown
 
-# Fatigue: the more XP gains in the last hour, the less each one is worth.
-# (gains in the last hour below this number, multiplier). No hard wall.
-FATIGUE_STEPS = [(30, 1.0), (50, 0.7), (70, 0.4), (10**9, 0.15)]
+# Fatigue (hourly limits). Raised to 500 so active humans never hit it, only 24/7 AI bots.
+FATIGUE_STEPS = [(100, 1.0), (200, 0.7), (500, 0.4), (10**9, 0.15)]
+MAX_XP_PER_HOUR = 500
 
-# Message quality (by number of different words)
-SINGLE_WORD_MULT = 0.25         # 1 word
-SHORT_MULT = 0.6                # 2-3 words
-LONG_MULT = 1.2                 # 10+ words
+# Message quality multipliers (Removed penalties! All words give 100% now)
+SINGLE_WORD_MULT = 1.0
+SHORT_MULT = 1.0
+LONG_MULT = 1.2
 
-# Someone else must be talking too, otherwise XP is reduced
-COMPANY_WINDOW = 5 * 60         # "someone else wrote here in the last 5 minutes"
-SOLO_MULTIPLIER = 0.3
-REPLY_BONUS = 1.15              # replying to another person
+# Company multiplier (Removed penalty! Chatting alone gives 100% now)
+COMPANY_WINDOW = 5 * 60
+SOLO_MULTIPLIER = 1.0
+REPLY_BONUS = 1.15
 
 # Mechanical-looking timing detector (scripts / macros)
-MECH_MESSAGES = 8               # look at the last 8 messages
-MECH_TOLERANCE = 1.5            # all gaps within 1.5 s of each other ...
-MECH_MIN_GAP = 3.0              # ... and every gap at least 3 s = suspicious
-SUSPICIOUS_SECONDS = 30 * 60    # reduced XP for this long
+MECH_MESSAGES = 8
+MECH_TOLERANCE = 1.5
+MECH_MIN_GAP = 3.0
+SUSPICIOUS_SECONDS = 30 * 60
 SUSPICIOUS_MULTIPLIER = 0.2
 
-# Voice also gives a little XP (only with 2+ people who can hear). 0 = no voice XP.
 VOICE_XP_PER_MINUTE = 5
 
-# Text XP (and Mups) are given ONLY in these channels. A channel counts if its name
-# contains one of these words (decorations like "┊✦〉" don't matter).
-# Threads of these channels count too. An empty list means XP everywhere.
+# XP CHANNELS = Empty list means XP works in ALL channels perfectly!
 XP_CHANNELS = []
 
-# XP boosts (global 2x event and personal Trick or Treat buffs) do NOT stack:
-# only the strongest one counts. Set to True to multiply them instead (x3 * 2 = x6).
 XP_BOOSTS_STACK = False
 
 # ANTI-SPAM (Soft):
@@ -86,10 +75,10 @@ MIN_UNIQUE_LETTERS = 2
 SPAM_HISTORY = 5
 SIMILARITY_LIMIT = 0.85
 
-# CURRENCY (Fast):
+# CURRENCY:
 MESSAGES_PER_MUPS = 25
 MUPS_REWARD = 15
-MUPS_ELIGIBLE_PER_HOUR = 60     # only the first 60 XP gains per hour count towards Mups
+MUPS_ELIGIBLE_PER_HOUR = 500     # Raised to 500 so you almost never stop earning Mups
 VOICE_SECONDS_PER_VUPS = 1800
 VUPS_REWARD = 1
 
@@ -238,7 +227,6 @@ class Database:
         return old_xp, old_xp + xp_gain, mups_gain
 
     def add_xp(self, guild_id: int, user_id: int, amount: int):
-        """Add XP without counting a message (voice XP). Returns (old_xp, new_xp)."""
         self._ensure(guild_id, user_id)
         old_xp = self.conn.execute(
             "SELECT xp FROM users WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
@@ -379,11 +367,6 @@ def progress_bar(current: int, total: int, length: int = 14) -> str:
     filled = int(length * current / total) if total else 0
     return "█" * filled + "░" * (length - filled)
 
-def progress_percent(current: int, total: int) -> int:
-    """Progress to the next level, rounded down to steps of 5 (exact XP numbers are hidden)."""
-    percent = int(100 * current / total) if total else 0
-    return percent - percent % 5
-
 def format_duration(seconds: int) -> str:
     minutes = seconds // 60
     hours, minutes = divmod(minutes, 60)
@@ -406,7 +389,6 @@ def is_blocked_name(name: str) -> bool:
 #  Role helpers
 # ======================================================================
 def _norm_role(text: str) -> str:
-    """Lowercase letters and digits only: '🍁 MAPLE SYROUP 🍁' -> 'maplesyroup'."""
     return re.sub(r"[\W_]+", "", text.lower())
 
 def find_role(guild: discord.Guild, name: str) -> discord.Role | None:
@@ -429,7 +411,6 @@ def level_role_set(guild: discord.Guild) -> set:
     return found
 
 def find_shop_role(guild: discord.Guild, name: str) -> discord.Role | None:
-    """Like find_role, but never returns a level-reward role (so the shop can't sell them)."""
     excluded = level_role_set(guild)
     candidates = [r for r in guild.roles if r not in excluded]
     lowered = name.lower()
@@ -493,9 +474,9 @@ async def mod_log(guild: discord.Guild, title: str, description: str):
     except (discord.Forbidden, discord.HTTPException): pass
 
 # ======================================================================
-#  Shop Data (Packs) - ALL 50% OFF
+#  Shop Data (Packs)
 # ======================================================================
-HALLOWEEN_EXPIRY = 1793750400   # 2026-11-04 00:00 UTC = the end of November 3
+HALLOWEEN_EXPIRY = 1793750400   
 
 SHOP_CATEGORIES = {
     "expie": {
@@ -758,7 +739,6 @@ class VerifyView(discord.ui.View):
             view=ConfirmView(), ephemeral=True
         )
 
-
 # ======================================================================
 #  Private voice chats
 # ======================================================================
@@ -923,21 +903,16 @@ class SillyBot(discord.Client):
 
 client = SillyBot()
 
-# ======================================================================
-#  XP engine
-# ======================================================================
-next_xp_time: dict[tuple[int, int], float] = {}                  # earliest time of the next XP gain
-recent_messages: dict[tuple[int, int], deque] = {}               # for the "similar message" filter
-xp_timestamps: dict[tuple[int, int], deque] = {}                 # XP gains in the last hour (fatigue)
-channel_activity: dict[int, deque] = {}                          # channel -> (time, author) of recent messages
-message_times: dict[tuple[int, int], deque] = {}                 # last message times (mechanical detector)
-suspicious_until: dict[tuple[int, int], float] = {}              # reduced XP until this time
+last_xp_time: dict[tuple[int, int], float] = {}
+recent_messages: dict[tuple[int, int], deque] = {}
+xp_timestamps: dict[tuple[int, int], deque] = {}
+channel_activity: dict[int, deque] = {}
+message_times: dict[tuple[int, int], deque] = {}
+suspicious_until: dict[tuple[int, int], float] = {}
 
 URL_RE = re.compile(r"https?://\S+")
-DISCORD_TAG_RE = re.compile(r"<a?:\w+:\d+>|<[@#][!&]?\d+>")
-WORD_RE = re.compile(r"[^\W\d_]+")
+DISCORD_TAG_RE = re.compile(r"<a?:\w+:\d+>|<[@#][!&]?\d+>")  
 
-# --- xp engine helpers (pure functions) ---
 def letters_only(text: str) -> str:
     text = URL_RE.sub("", text)
     text = DISCORD_TAG_RE.sub("", text)
@@ -955,29 +930,25 @@ def is_real_message(key: tuple[int, int], content: str) -> bool:
 def unique_word_count(text: str) -> int:
     text = URL_RE.sub(" ", text)
     text = DISCORD_TAG_RE.sub(" ", text)
-    return len(set(WORD_RE.findall(text.lower())))
+    return len(set(re.findall(r"[^\W\d_]+", text.lower())))
 
 def quality_multiplier(unique_words: int) -> float:
-    """C: more different words = more XP. Repeating one word gives very little."""
     if unique_words <= 1: return SINGLE_WORD_MULT
     if unique_words <= 3: return SHORT_MULT
     if unique_words <= 9: return 1.0
     return LONG_MULT
 
 def fatigue_multiplier(gains_last_hour: int) -> float:
-    """B: smooth slowdown instead of a hard wall."""
     for limit, mult in FATIGUE_STEPS:
         if gains_last_hour < limit: return mult
     return FATIGUE_STEPS[-1][1]
 
 def has_company(channel_id: int, author_id: int, now: float) -> bool:
-    """D: did someone else write in this channel recently?"""
     recent = channel_activity.get(channel_id)
     if not recent: return False
     return any(author != author_id and now - when <= COMPANY_WINDOW for when, author in recent)
 
 def looks_mechanical(key: tuple[int, int], now: float) -> bool:
-    """E: messages arriving at suspiciously even intervals (scripts, macros)."""
     times = message_times.setdefault(key, deque(maxlen=MECH_MESSAGES))
     times.append(now)
     if len(times) < MECH_MESSAGES: return False
@@ -986,24 +957,17 @@ def looks_mechanical(key: tuple[int, int], now: float) -> bool:
     return min(gaps) >= MECH_MIN_GAP and (max(gaps) - min(gaps)) <= MECH_TOLERANCE
 
 def channel_gives_xp(channel) -> bool:
-    """XP only in the channels listed in XP_CHANNELS (text channels and their threads)."""
     if not XP_CHANNELS: return True
-    base = getattr(channel, "parent", None) or channel   # a thread counts as its parent channel
+    base = getattr(channel, "parent", None) or channel
     if not isinstance(base, discord.TextChannel): return False
     name = base.name.lower()
     return any(word.lower() in name for word in XP_CHANNELS)
 
 def combine_xp_multipliers(global_mult: float, personal_mult: float) -> float:
-    """Global event and personal buff: the strongest boost wins, they don't multiply.
-    A curse (below 1.0) still applies when there is no boost."""
-    if XP_BOOSTS_STACK:
-        return global_mult * personal_mult
+    if XP_BOOSTS_STACK: return global_mult * personal_mult
     boosts = [m for m in (global_mult, personal_mult) if m > 1.0]
-    if boosts:
-        return max(boosts)
+    if boosts: return max(boosts)
     return min(global_mult, personal_mult)
-# --- end xp engine helpers ---
-
 
 # ======================================================================
 #  Background tasks
@@ -1018,7 +982,6 @@ async def voice_tracker():
     for channel in guild.voice_channels + guild.stage_channels:
         if channel == guild.afk_channel: continue
         humans = [m for m in channel.members if not m.bot]
-        # G: only count people who can actually hear, and need at least 2 of them
         listeners = [
             m for m in humans
             if m.voice is not None and m.voice.channel == channel and not (m.voice.deaf or m.voice.self_deaf)
@@ -1105,18 +1068,15 @@ async def on_message(message: discord.Message):
     now_f = time.time()
     now = int(now_f)
 
-    # --- context about this message ---
     company = has_company(message.channel.id, member.id, now_f)
-
     replied_to_human = False
     reference = message.reference
     if reference is not None and isinstance(reference.resolved, discord.Message):
         original_author = reference.resolved.author
         if original_author.id != member.id and not original_author.bot:
             replied_to_human = True
-            company = True   # answering someone counts as talking together
+            company = True
 
-    # E: scripts and macros send messages at very even intervals
     if looks_mechanical(key, now_f) and now_f >= suspicious_until.get(key, 0):
         suspicious_until[key] = now_f + SUSPICIOUS_SECONDS
         await mod_log(
@@ -1130,45 +1090,41 @@ async def on_message(message: discord.Message):
 
     counted = is_real_message(key, message.content)
 
-    # --- XP ---
     gain = 0
     count_for_mups = False
+    
     if counted and channel_gives_xp(message.channel) and now_f >= next_xp_time.get(key, 0):
         history = xp_timestamps.setdefault(key, deque())
         while history and now - history[0] > 3600:
             history.popleft()
         gains_last_hour = len(history)
 
-        data = db.get(message.guild.id, member.id)
-        current_level = level_from_xp(data["xp"])[0]
+        if gains_last_hour < MAX_XP_PER_HOUR:
+            data = db.get(message.guild.id, member.id)
+            current_level = level_from_xp(data["xp"])[0]
 
-        quality = quality_multiplier(unique_word_count(message.content))
-        fatigue = fatigue_multiplier(gains_last_hour)
-        company_mult = 1.0 if company else SOLO_MULTIPLIER
-        suspicious_mult = SUSPICIOUS_MULTIPLIER if now_f < suspicious_until.get(key, 0) else 1.0
-        reply_mult = REPLY_BONUS if replied_to_human else 1.0
+            quality = quality_multiplier(unique_word_count(message.content))
+            fatigue = fatigue_multiplier(gains_last_hour)
+            company_mult = 1.0 if company else SOLO_MULTIPLIER
+            suspicious_mult = SUSPICIOUS_MULTIPLIER if now_f < suspicious_until.get(key, 0) else 1.0
+            reply_mult = REPLY_BONUS if replied_to_human else 1.0
 
-        base_gain = random.randint(XP_MIN, XP_MAX)
-        level_bonus = int(current_level * 0.5)
+            base_gain = random.randint(XP_MIN, XP_MAX)
+            level_bonus = int(current_level * 0.5)
 
-        # Global / TrickOrTreat Multipliers
-        global_xp = float(db.get_setting("global_xp_mult", "1.0"))
-        tot_xp_buff = 1.0
-        if now < data.get("xp_buff_end", 0):
-            tot_xp_buff = data.get("xp_buff_value", 1.0)
+            global_xp = float(db.get_setting("global_xp_mult", "1.0"))
+            tot_xp_buff = 1.0
+            if now < data.get("xp_buff_end", 0):
+                tot_xp_buff = data.get("xp_buff_value", 1.0)
 
-        event_mult = combine_xp_multipliers(global_xp, tot_xp_buff)
-        gain = int((base_gain + level_bonus) * quality * fatigue * company_mult * suspicious_mult * reply_mult * event_mult)
-        gain = max(1, gain)
+            event_mult = combine_xp_multipliers(global_xp, tot_xp_buff)
+            gain = int((base_gain + level_bonus) * quality * fatigue * company_mult * suspicious_mult * reply_mult * event_mult)
+            gain = max(1, gain)
 
-        # Mups only for real conversation, and only for the first gains of each hour
-        count_for_mups = (
-            quality >= SHORT_MULT and company and suspicious_mult == 1.0
-            and gains_last_hour < MUPS_ELIGIBLE_PER_HOUR
-        )
+            count_for_mups = (suspicious_mult == 1.0 and gains_last_hour < MUPS_ELIGIBLE_PER_HOUR)
 
-        next_xp_time[key] = now_f + random.uniform(*XP_COOLDOWN_RANGE)
-        history.append(now)
+            next_xp_time[key] = now_f + random.uniform(*XP_COOLDOWN_RANGE)
+            history.append(now)
 
     has_booster = any("CERTIFIED PAWBOOSTER" in r.name.upper() for r in member.roles)
     booster_mult = 1.5 if has_booster else 1.0
@@ -1226,9 +1182,12 @@ async def profile(interaction: discord.Interaction, member: discord.Member | Non
             break
 
     colour = target_member.colour if target_member.colour.value else PINK
+    
+    # ВОЗВРАЩЕНЫ ТОЧНЫЕ ЦИФРЫ ОПЫТА, ЧТОБЫ БЫЛО ВИДНО ПРОГРЕСС
+    percent = int(100 * into_level / needed) if needed else 0
     embed = discord.Embed(
         title=f"{target_member.display_name}'s profile",
-        description=f"**Level {level}**  |  Rank **#{rank}**\n`{progress_bar(into_level, needed)}`  {progress_percent(into_level, needed)}% to the next level",
+        description=f"**Level {level}**  |  Rank **#{rank}**\n`{progress_bar(into_level, needed)}`  {into_level:,} / {needed:,} XP ({percent}%)",
         colour=colour,
     )
     embed.set_thumbnail(url=target_member.display_avatar.url)
@@ -1242,7 +1201,7 @@ async def profile(interaction: discord.Interaction, member: discord.Member | Non
     embed.add_field(name="Time in voice", value=format_duration(data["voice_seconds"]), inline=True)
 
     embed.add_field(name="Next reward", value=next_reward, inline=False)
-    embed.set_footer(text="Keep chatting and be silly :3")
+    embed.set_footer(text=f"Total XP: {data['xp']:,}")
 
     if target_member.id == interaction.user.id:
         view = ProfileView(target_member)
@@ -1269,9 +1228,10 @@ async def progress(interaction: discord.Interaction):
         else:
             lines.append(f"🔒 **Level {req_level}:** {shown}")
 
+    percent = int(100 * into_level / needed) if needed else 0
     embed = discord.Embed(
         title="📈 Your Level Progress",
-        description=f"**Current Level: {current_level}**\n`{progress_bar(into_level, needed)}` {progress_percent(into_level, needed)}% to the next level\n\n**Role Unlocks:**\n" + "\n".join(lines),
+        description=f"**Current Level: {current_level}**\n`{progress_bar(into_level, needed)}` {into_level:,} / {needed:,} XP ({percent}%)\n\n**Role Unlocks:**\n" + "\n".join(lines),
         colour=PINK
     )
     await interaction.response.send_message(embed=embed)
@@ -1379,15 +1339,11 @@ async def my_cookies(interaction: discord.Interaction):
 # ======================================================================
 #  Trick or Treat 🎃
 # ======================================================================
-# How likely each Treat outcome is (relative weights). Outcome 3 = x3 XP boost and
-# outcome 6 = Pumpkin Pie color are rare: 1 of 52 treats, i.e. about 1% of all plays.
 TOT_TREAT_WEIGHTS = {1: 10, 2: 10, 3: 1, 4: 10, 5: 10, 6: 1, 7: 10}
-TOT_X3_DURATION = 14 * 3600     # the x3 boost lasts 14 hours
-TOT_BUFF_DURATION = 24 * 3600   # the other buffs last 24 hours
+TOT_X3_DURATION = 14 * 3600     
+TOT_BUFF_DURATION = 24 * 3600   
 
 def try_apply_xp_buff(guild_id: int, user_id: int, data: dict, now: int, duration: int, value: float) -> bool:
-    """Personal XP buffs never stack. A new one is only applied if no buff is running
-    or if it is stronger than the running one. Returns True if it was applied."""
     running = now < data.get("xp_buff_end", 0)
     if running and value <= data.get("xp_buff_value", 1.0):
         return False
@@ -1621,7 +1577,6 @@ async def give_lvl(interaction: discord.Interaction, user: discord.Member, amoun
 
     guild_id = interaction.guild.id
     old_level = level_from_xp(db.get(guild_id, user.id)["xp"])[0]
-    # Add exactly the XP that `amount` levels cost, so the progress inside the level stays the same
     db.add_xp(guild_id, user.id, xp_for_level(old_level + amount) - xp_for_level(old_level))
     new_level = old_level + amount
 
@@ -1672,6 +1627,7 @@ async def remove_lvl(interaction: discord.Interaction, user: discord.Member, amo
     if removed_roles:
         text += " Roles removed: " + ", ".join(f"**{role.name}**" for role in removed_roles)
     await interaction.followup.send(text, ephemeral=True)
+
 
 @client.tree.command(name="setup_verify", description="Post the verification message (admins only)")
 @app_commands.default_permissions(administrator=True)

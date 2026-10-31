@@ -74,7 +74,7 @@ VOICE_XP_PER_MINUTE = 5
 # Text XP (and Mups) are given ONLY in these channels. A channel counts if its name
 # contains one of these words (decorations like "┊✦〉" don't matter).
 # Threads of these channels count too. An empty list means XP everywhere.
-XP_CHANNELS = ["general", "meme-stuff"]
+XP_CHANNELS = []
 
 # XP boosts (global 2x event and personal Trick or Treat buffs) do NOT stack:
 # only the strongest one counts. Set to True to multiply them instead (x3 * 2 = x6).

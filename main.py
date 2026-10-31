@@ -43,8 +43,8 @@ LEVEL_ROLES = [
 # ----------------------------------------------------------------------
 #  XP system
 # ----------------------------------------------------------------------
-XP_MIN = 10
-XP_MAX = 25
+XP_MIN = 20
+XP_MAX = 35
 XP_COOLDOWN_RANGE = (15, 40)    # random seconds between two XP gains (hidden from players)
 
 # Fatigue: the more XP gains in the last hour, the less each one is worth.
@@ -75,6 +75,10 @@ VOICE_XP_PER_MINUTE = 5
 # contains one of these words (decorations like "┊✦〉" don't matter).
 # Threads of these channels count too. An empty list means XP everywhere.
 XP_CHANNELS = ["general", "meme-stuff"]
+
+# XP boosts (global 2x event and personal Trick or Treat buffs) do NOT stack:
+# only the strongest one counts. Set to True to multiply them instead (x3 * 2 = x6).
+XP_BOOSTS_STACK = False
 
 # ANTI-SPAM (Soft):
 MIN_LETTERS = 2
@@ -988,6 +992,16 @@ def channel_gives_xp(channel) -> bool:
     if not isinstance(base, discord.TextChannel): return False
     name = base.name.lower()
     return any(word.lower() in name for word in XP_CHANNELS)
+
+def combine_xp_multipliers(global_mult: float, personal_mult: float) -> float:
+    """Global event and personal buff: the strongest boost wins, they don't multiply.
+    A curse (below 1.0) still applies when there is no boost."""
+    if XP_BOOSTS_STACK:
+        return global_mult * personal_mult
+    boosts = [m for m in (global_mult, personal_mult) if m > 1.0]
+    if boosts:
+        return max(boosts)
+    return min(global_mult, personal_mult)
 # --- end xp engine helpers ---
 
 
@@ -1135,7 +1149,7 @@ async def on_message(message: discord.Message):
         reply_mult = REPLY_BONUS if replied_to_human else 1.0
 
         base_gain = random.randint(XP_MIN, XP_MAX)
-        level_bonus = int(current_level * 0.2)
+        level_bonus = int(current_level * 0.5)
 
         # Global / TrickOrTreat Multipliers
         global_xp = float(db.get_setting("global_xp_mult", "1.0"))
@@ -1143,7 +1157,8 @@ async def on_message(message: discord.Message):
         if now < data.get("xp_buff_end", 0):
             tot_xp_buff = data.get("xp_buff_value", 1.0)
 
-        gain = int((base_gain + level_bonus) * quality * fatigue * company_mult * suspicious_mult * reply_mult * global_xp * tot_xp_buff)
+        event_mult = combine_xp_multipliers(global_xp, tot_xp_buff)
+        gain = int((base_gain + level_bonus) * quality * fatigue * company_mult * suspicious_mult * reply_mult * event_mult)
         gain = max(1, gain)
 
         # Mups only for real conversation, and only for the first gains of each hour
@@ -1364,6 +1379,21 @@ async def my_cookies(interaction: discord.Interaction):
 # ======================================================================
 #  Trick or Treat 🎃
 # ======================================================================
+# How likely each Treat outcome is (relative weights). Outcome 3 = x3 XP boost and
+# outcome 6 = Pumpkin Pie color are rare: 1 of 52 treats, i.e. about 1% of all plays.
+TOT_TREAT_WEIGHTS = {1: 10, 2: 10, 3: 1, 4: 10, 5: 10, 6: 1, 7: 10}
+TOT_X3_DURATION = 14 * 3600     # the x3 boost lasts 14 hours
+TOT_BUFF_DURATION = 24 * 3600   # the other buffs last 24 hours
+
+def try_apply_xp_buff(guild_id: int, user_id: int, data: dict, now: int, duration: int, value: float) -> bool:
+    """Personal XP buffs never stack. A new one is only applied if no buff is running
+    or if it is stronger than the running one. Returns True if it was applied."""
+    running = now < data.get("xp_buff_end", 0)
+    if running and value <= data.get("xp_buff_value", 1.0):
+        return False
+    db.set_xp_buff(guild_id, user_id, now + duration, value)
+    return True
+
 @client.tree.command(name="trick_or_treat", description="Trick or Treat! Random events, good or bad!")
 @app_commands.guild_only()
 async def trick_or_treat(interaction: discord.Interaction):
@@ -1383,7 +1413,10 @@ async def trick_or_treat(interaction: discord.Interaction):
     db.set_tot_cooldown(guild_id, user_id, now)
 
     is_treat = random.choice([True, False])
-    outcome = random.randint(1, 7)
+    if is_treat:
+        outcome = random.choices(list(TOT_TREAT_WEIGHTS), weights=list(TOT_TREAT_WEIGHTS.values()))[0]
+    else:
+        outcome = random.randint(1, 7)
 
     title_text = "Treat" if is_treat else "Trick"
     msg = ""
@@ -1403,8 +1436,10 @@ async def trick_or_treat(interaction: discord.Interaction):
             msg = f"Yummy! you got {amount} cookies!🍪"
 
         elif outcome == 3:
-            db.set_xp_buff(guild_id, user_id, now + 86400, 3.0)
-            msg = "WOAAHHWW!!! You get a HUGE x3 XP Boost for the next 24 hours! Great luck ^^"
+            if try_apply_xp_buff(guild_id, user_id, data, now, TOT_X3_DURATION, 3.0):
+                msg = "WOAAHHWW!!! You get a HUGE x3 XP Boost for the next 14 hours! Great luck ^^"
+            else:
+                msg = "WOAAHHWW!!! A HUGE x3 XP Boost... but you already have one running. Boosts don't stack, sowwee ~w~"
 
         elif outcome == 4:
             current_lvl, _, _ = level_from_xp(data["xp"])
@@ -1433,7 +1468,9 @@ async def trick_or_treat(interaction: discord.Interaction):
 
         elif outcome == 6:
             role = await get_role(interaction.guild, "Pumpkin Pie")
-            if role:
+            if role and role in interaction.user.roles:
+                msg = "YESS.. I HIT THE LIMITED THING! But you already have the exclusive Pumpkin Pie name color!"
+            elif role:
                 try:
                     await interaction.user.add_roles(role, reason="Trick or Treat")
                     msg = "YESS.. I HIT THE LIMITED THING! You unlocked the exclusive Pumpkin Pie name color"
@@ -1443,8 +1480,10 @@ async def trick_or_treat(interaction: discord.Interaction):
                 msg = "YESS.. but I couldn't find the Pumpkin Pie role!"
 
         elif outcome == 7:
-            db.set_xp_buff(guild_id, user_id, now + 86400, 1.4)
-            msg = "HEAVENLY LUCK FOR A BUFF! You will earn +40% MORE XP for the next 24 hours! "
+            if try_apply_xp_buff(guild_id, user_id, data, now, TOT_BUFF_DURATION, 1.4):
+                msg = "HEAVENLY LUCK FOR A BUFF! You will earn +40% MORE XP for the next 24 hours! "
+            else:
+                msg = "HEAVENLY LUCK FOR A BUFF! But you already have a boost running, and boosts don't stack ~w~"
 
     else:  # TRICK
         if outcome == 1:
@@ -1504,8 +1543,10 @@ async def trick_or_treat(interaction: discord.Interaction):
                 msg = "Guhh.. I wanted ur items but you got nothing.. ~w~"
 
         elif outcome == 7:
-            db.set_xp_buff(guild_id, user_id, now + 86400, 0.95)
-            msg = "You ate a cursed candy! You will earn 5% less XP for the next 24 hours..."
+            if try_apply_xp_buff(guild_id, user_id, data, now, TOT_BUFF_DURATION, 0.95):
+                msg = "You ate a cursed candy! You will earn 5% less XP for the next 24 hours..."
+            else:
+                msg = "You ate a cursed candy! But the boost you have running protected you :3"
 
     await interaction.response.send_message(f"{title_text}\n\n{msg}")
 
@@ -1706,24 +1747,60 @@ async def event_2x_currency(interaction: discord.Interaction):
         db.set_setting("global_curr_mult", "1.0")
         await interaction.response.send_message("🛑 **Global 2x Currency has ended!**", ephemeral=False)
 
-@client.tree.command(name="give", description="Give Mups or Vups to a user (Admins/Owner only)")
-@app_commands.describe(user="The user to give currency to", amount="Amount to give", currency="Which currency?")
-@app_commands.choices(currency=[
-    app_commands.Choice(name="Mups", value="mups"),
-    app_commands.Choice(name="Vups", value="vups"),
-])
-@app_commands.default_permissions(administrator=True)
-@app_commands.guild_only()
-async def give_currency(interaction: discord.Interaction, user: discord.Member, amount: int, currency: app_commands.Choice[str]):
-    if interaction.user.id != interaction.guild.owner_id and not interaction.user.guild_permissions.administrator:
+# /give is now a group: /give mups, /give vups, /give lvl
+give_group = app_commands.Group(
+    name="give",
+    description="Give Mups, Vups or levels (admins only)",
+    default_permissions=discord.Permissions(administrator=True),
+    guild_only=True,
+)
+
+def is_server_admin(interaction: discord.Interaction) -> bool:
+    return interaction.user.id == interaction.guild.owner_id or interaction.user.guild_permissions.administrator
+
+@give_group.command(name="mups", description="Give Mups to a user")
+@app_commands.describe(user="Who gets the Mups", amount="How many Mups")
+async def give_mups(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1, 1000000]):
+    if not is_server_admin(interaction):
         await interaction.response.send_message("Only the server creator or admins can do this.", ephemeral=True)
         return
-    if amount <= 0:
-        await interaction.response.send_message("Amount must be a positive number.", ephemeral=True)
+    db.add_currency(interaction.guild.id, user.id, amount, 0)
+    await interaction.response.send_message(f"Successfully gave {amount} Mups to {user.mention}!", ephemeral=True)
+
+@give_group.command(name="vups", description="Give Vups to a user")
+@app_commands.describe(user="Who gets the Vups", amount="How many Vups")
+async def give_vups(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1, 1000000]):
+    if not is_server_admin(interaction):
+        await interaction.response.send_message("Only the server creator or admins can do this.", ephemeral=True)
         return
-    if currency.value == "mups": db.add_currency(interaction.guild.id, user.id, amount, 0)
-    else: db.add_currency(interaction.guild.id, user.id, 0, amount)
-    await interaction.response.send_message(f"Successfully gave {amount} {currency.name} to {user.mention}!", ephemeral=True)
+    db.add_currency(interaction.guild.id, user.id, 0, amount)
+    await interaction.response.send_message(f"Successfully gave {amount} Vups to {user.mention}!", ephemeral=True)
+
+@give_group.command(name="lvl", description="Give levels to a user")
+@app_commands.describe(user="Who gets the levels", amount="How many levels (default 1)")
+async def give_lvl(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1, 200] = 1):
+    if not is_server_admin(interaction):
+        await interaction.response.send_message("Only the server creator or admins can do this.", ephemeral=True)
+        return
+    if user.bot:
+        await interaction.response.send_message("Bots don't have levels.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)   # giving roles can take a moment
+
+    guild_id = interaction.guild.id
+    old_level = level_from_xp(db.get(guild_id, user.id)["xp"])[0]
+    # Add exactly the XP that `amount` levels cost, so the progress inside the level stays the same
+    db.add_xp(guild_id, user.id, xp_for_level(old_level + amount) - xp_for_level(old_level))
+    new_level = old_level + amount
+
+    granted = await sync_level_roles(user, new_level)
+    text = f"Gave {amount} level{'s' if amount != 1 else ''} to {user.mention}: level {old_level} -> level {new_level}."
+    if granted:
+        text += " Roles unlocked: " + ", ".join(f"**{role.name}**" for role in granted)
+    await interaction.followup.send(text, ephemeral=True)
+
+client.tree.add_command(give_group)
 
 
 @client.tree.command(name="setup_verify", description="Post the verification message (admins only)")

@@ -43,7 +43,7 @@ LEVEL_ROLES = [
 # ----------------------------------------------------------------------
 #  XP system
 # ----------------------------------------------------------------------
-XP_MIN = 5
+XP_MIN = 10
 XP_MAX = 25
 XP_COOLDOWN_RANGE = (15, 40)    # random seconds between two XP gains (hidden from players)
 
@@ -68,8 +68,13 @@ MECH_MIN_GAP = 3.0              # ... and every gap at least 3 s = suspicious
 SUSPICIOUS_SECONDS = 30 * 60    # reduced XP for this long
 SUSPICIOUS_MULTIPLIER = 0.2
 
-# Voice also gives a little XP (only with 2+ people who can hear)
+# Voice also gives a little XP (only with 2+ people who can hear). 0 = no voice XP.
 VOICE_XP_PER_MINUTE = 5
+
+# Text XP (and Mups) are given ONLY in these channels. A channel counts if its name
+# contains one of these words (decorations like "┊✦〉" don't matter).
+# Threads of these channels count too. An empty list means XP everywhere.
+XP_CHANNELS = ["general", "meme-stuff"]
 
 # ANTI-SPAM (Soft):
 MIN_LETTERS = 2
@@ -975,6 +980,14 @@ def looks_mechanical(key: tuple[int, int], now: float) -> bool:
     ordered = list(times)
     gaps = [b - a for a, b in zip(ordered, ordered[1:])]
     return min(gaps) >= MECH_MIN_GAP and (max(gaps) - min(gaps)) <= MECH_TOLERANCE
+
+def channel_gives_xp(channel) -> bool:
+    """XP only in the channels listed in XP_CHANNELS (text channels and their threads)."""
+    if not XP_CHANNELS: return True
+    base = getattr(channel, "parent", None) or channel   # a thread counts as its parent channel
+    if not isinstance(base, discord.TextChannel): return False
+    name = base.name.lower()
+    return any(word.lower() in name for word in XP_CHANNELS)
 # --- end xp engine helpers ---
 
 
@@ -1106,7 +1119,7 @@ async def on_message(message: discord.Message):
     # --- XP ---
     gain = 0
     count_for_mups = False
-    if counted and now_f >= next_xp_time.get(key, 0):
+    if counted and channel_gives_xp(message.channel) and now_f >= next_xp_time.get(key, 0):
         history = xp_timestamps.setdefault(key, deque())
         while history and now - history[0] > 3600:
             history.popleft()
@@ -1122,7 +1135,7 @@ async def on_message(message: discord.Message):
         reply_mult = REPLY_BONUS if replied_to_human else 1.0
 
         base_gain = random.randint(XP_MIN, XP_MAX)
-        level_bonus = int(current_level * 0.5)
+        level_bonus = int(current_level * 0.2)
 
         # Global / TrickOrTreat Multipliers
         global_xp = float(db.get_setting("global_xp_mult", "1.0"))

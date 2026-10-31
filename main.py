@@ -43,9 +43,6 @@ XP_COOLDOWN_RANGE = (5, 8)    # VERY FAST cooldown so active chatters get reward
 # Fatigue (hourly limits). Raised to 500 so active humans never hit it, only 24/7 AI bots.
 MAX_XP_PER_HOUR = 500
 
-# XP CHANNELS = Empty list means XP works in ALL channels perfectly!
-XP_CHANNELS = []
-
 # ANTI-SPAM (Very Soft - just blocks 1-letter spam like "a", "b", "c")
 MIN_LETTERS = 2
 MIN_UNIQUE_LETTERS = 2
@@ -429,9 +426,8 @@ def find_channel_mention(guild: discord.Guild, keyword: str) -> str:
     channel = discord.utils.find(lambda c: keyword in c.name.lower(), guild.channels)
     return channel.mention if channel else f"#{keyword}"
 
-
 # ======================================================================
-#  Shop Data (Packs) - ALL 50% OFF
+#  Shop Data (Packs)
 # ======================================================================
 HALLOWEEN_EXPIRY = 1793750400   
 

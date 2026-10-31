@@ -5,7 +5,6 @@ import sqlite3
 import time
 import datetime
 from collections import deque
-from difflib import SequenceMatcher
 
 import discord
 from discord import app_commands
@@ -39,46 +38,22 @@ LEVEL_ROLES = [
 # ----------------------------------------------------------------------
 XP_MIN = 20
 XP_MAX = 35
-XP_COOLDOWN_RANGE = (10, 12)    # Very fast, stable cooldown
+XP_COOLDOWN_RANGE = (5, 8)    # VERY FAST cooldown so active chatters get rewarded
 
 # Fatigue (hourly limits). Raised to 500 so active humans never hit it, only 24/7 AI bots.
-FATIGUE_STEPS = [(100, 1.0), (200, 0.7), (500, 0.4), (10**9, 0.15)]
 MAX_XP_PER_HOUR = 500
-
-# Message quality multipliers (Removed penalties! All words give 100% now)
-SINGLE_WORD_MULT = 1.0
-SHORT_MULT = 1.0
-LONG_MULT = 1.2
-
-# Company multiplier (Removed penalty! Chatting alone gives 100% now)
-COMPANY_WINDOW = 5 * 60
-SOLO_MULTIPLIER = 1.0
-REPLY_BONUS = 1.15
-
-# Mechanical-looking timing detector (scripts / macros)
-MECH_MESSAGES = 8
-MECH_TOLERANCE = 1.5
-MECH_MIN_GAP = 3.0
-SUSPICIOUS_SECONDS = 30 * 60
-SUSPICIOUS_MULTIPLIER = 0.2
-
-VOICE_XP_PER_MINUTE = 5
 
 # XP CHANNELS = Empty list means XP works in ALL channels perfectly!
 XP_CHANNELS = []
 
-XP_BOOSTS_STACK = False
-
-# ANTI-SPAM (Soft):
+# ANTI-SPAM (Very Soft - just blocks 1-letter spam like "a", "b", "c")
 MIN_LETTERS = 2
 MIN_UNIQUE_LETTERS = 2
-SPAM_HISTORY = 5
-SIMILARITY_LIMIT = 0.85
 
 # CURRENCY:
 MESSAGES_PER_MUPS = 25
 MUPS_REWARD = 15
-MUPS_ELIGIBLE_PER_HOUR = 500     # Raised to 500 so you almost never stop earning Mups
+MUPS_ELIGIBLE_PER_HOUR = 500     # Almost never stop earning Mups
 VOICE_SECONDS_PER_VUPS = 1800
 VUPS_REWARD = 1
 
@@ -454,27 +429,9 @@ def find_channel_mention(guild: discord.Guild, keyword: str) -> str:
     channel = discord.utils.find(lambda c: keyword in c.name.lower(), guild.channels)
     return channel.mention if channel else f"#{keyword}"
 
-# ======================================================================
-#  Mod log (warnings for moderators)
-# ======================================================================
-def get_mod_log_channel(guild: discord.Guild):
-    if MOD_LOG_CHANNEL_ID:
-        channel = guild.get_channel(MOD_LOG_CHANNEL_ID)
-        if channel is not None: return channel
-    keywords = ("mod-log", "modlog", "moderator-only")
-    return discord.utils.find(
-        lambda c: isinstance(c, discord.TextChannel) and any(k in c.name.lower() for k in keywords),
-        guild.channels,
-    )
-
-async def mod_log(guild: discord.Guild, title: str, description: str):
-    channel = get_mod_log_channel(guild)
-    if channel is None: return
-    try: await channel.send(embed=discord.Embed(title=title, description=description, colour=PINK))
-    except (discord.Forbidden, discord.HTTPException): pass
 
 # ======================================================================
-#  Shop Data (Packs)
+#  Shop Data (Packs) - ALL 50% OFF
 # ======================================================================
 HALLOWEEN_EXPIRY = 1793750400   
 
@@ -904,11 +861,7 @@ class SillyBot(discord.Client):
 client = SillyBot()
 
 last_xp_time: dict[tuple[int, int], float] = {}
-recent_messages: dict[tuple[int, int], deque] = {}
 xp_timestamps: dict[tuple[int, int], deque] = {}
-channel_activity: dict[int, deque] = {}
-message_times: dict[tuple[int, int], deque] = {}
-suspicious_until: dict[tuple[int, int], float] = {}
 
 URL_RE = re.compile(r"https?://\S+")
 DISCORD_TAG_RE = re.compile(r"<a?:\w+:\d+>|<[@#][!&]?\d+>")  
@@ -918,56 +871,10 @@ def letters_only(text: str) -> str:
     text = DISCORD_TAG_RE.sub("", text)
     return re.sub(r"[\W\d_]+", "", text).lower()
 
-def is_real_message(key: tuple[int, int], content: str) -> bool:
+def is_real_message(content: str) -> bool:
     letters = letters_only(content)
     if len(letters) < MIN_LETTERS or len(set(letters)) < MIN_UNIQUE_LETTERS: return False
-    history = recent_messages.setdefault(key, deque(maxlen=SPAM_HISTORY))
-    for old in history:
-        if SequenceMatcher(None, old, letters).ratio() >= SIMILARITY_LIMIT: return False
-    history.append(letters)
     return True
-
-def unique_word_count(text: str) -> int:
-    text = URL_RE.sub(" ", text)
-    text = DISCORD_TAG_RE.sub(" ", text)
-    return len(set(re.findall(r"[^\W\d_]+", text.lower())))
-
-def quality_multiplier(unique_words: int) -> float:
-    if unique_words <= 1: return SINGLE_WORD_MULT
-    if unique_words <= 3: return SHORT_MULT
-    if unique_words <= 9: return 1.0
-    return LONG_MULT
-
-def fatigue_multiplier(gains_last_hour: int) -> float:
-    for limit, mult in FATIGUE_STEPS:
-        if gains_last_hour < limit: return mult
-    return FATIGUE_STEPS[-1][1]
-
-def has_company(channel_id: int, author_id: int, now: float) -> bool:
-    recent = channel_activity.get(channel_id)
-    if not recent: return False
-    return any(author != author_id and now - when <= COMPANY_WINDOW for when, author in recent)
-
-def looks_mechanical(key: tuple[int, int], now: float) -> bool:
-    times = message_times.setdefault(key, deque(maxlen=MECH_MESSAGES))
-    times.append(now)
-    if len(times) < MECH_MESSAGES: return False
-    ordered = list(times)
-    gaps = [b - a for a, b in zip(ordered, ordered[1:])]
-    return min(gaps) >= MECH_MIN_GAP and (max(gaps) - min(gaps)) <= MECH_TOLERANCE
-
-def channel_gives_xp(channel) -> bool:
-    if not XP_CHANNELS: return True
-    base = getattr(channel, "parent", None) or channel
-    if not isinstance(base, discord.TextChannel): return False
-    name = base.name.lower()
-    return any(word.lower() in name for word in XP_CHANNELS)
-
-def combine_xp_multipliers(global_mult: float, personal_mult: float) -> float:
-    if XP_BOOSTS_STACK: return global_mult * personal_mult
-    boosts = [m for m in (global_mult, personal_mult) if m > 1.0]
-    if boosts: return max(boosts)
-    return min(global_mult, personal_mult)
 
 # ======================================================================
 #  Background tasks
@@ -1062,38 +969,26 @@ async def on_member_join(member: discord.Member):
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot or message.guild is None or message.guild.id != GUILD_ID: return
+    
+    # MAGIC ADMIN COMMAND TO FIX MISSING SLASH COMMANDS
+    if message.content.startswith("!sync"):
+        if message.author.guild_permissions.administrator or message.author.id == message.guild.owner_id:
+            await client.tree.sync(guild=message.guild)
+            await message.channel.send("✅ Slash commands successfully synced! They should appear immediately.")
+            return
+
     member = message.author
     pings = len({m.id for m in message.mentions if not m.bot and m.id != member.id})
     key = (message.guild.id, member.id)
     now_f = time.time()
     now = int(now_f)
 
-    company = has_company(message.channel.id, member.id, now_f)
-    replied_to_human = False
-    reference = message.reference
-    if reference is not None and isinstance(reference.resolved, discord.Message):
-        original_author = reference.resolved.author
-        if original_author.id != member.id and not original_author.bot:
-            replied_to_human = True
-            company = True
-
-    if looks_mechanical(key, now_f) and now_f >= suspicious_until.get(key, 0):
-        suspicious_until[key] = now_f + SUSPICIOUS_SECONDS
-        await mod_log(
-            message.guild,
-            "Suspicious message timing",
-            f"{member.mention} in {message.channel.mention} sends messages at very even intervals. "
-            f"Their XP is reduced for {SUSPICIOUS_SECONDS // 60} minutes.",
-        )
-
-    channel_activity.setdefault(message.channel.id, deque(maxlen=30)).append((now_f, member.id))
-
-    counted = is_real_message(key, message.content)
+    counted = is_real_message(message.content)
 
     gain = 0
     count_for_mups = False
     
-    if counted and channel_gives_xp(message.channel) and now_f >= next_xp_time.get(key, 0):
+    if counted and now_f >= last_xp_time.get(key, 0):
         history = xp_timestamps.setdefault(key, deque())
         while history and now - history[0] > 3600:
             history.popleft()
@@ -1102,28 +997,22 @@ async def on_message(message: discord.Message):
         if gains_last_hour < MAX_XP_PER_HOUR:
             data = db.get(message.guild.id, member.id)
             current_level = level_from_xp(data["xp"])[0]
-
-            quality = quality_multiplier(unique_word_count(message.content))
-            fatigue = fatigue_multiplier(gains_last_hour)
-            company_mult = 1.0 if company else SOLO_MULTIPLIER
-            suspicious_mult = SUSPICIOUS_MULTIPLIER if now_f < suspicious_until.get(key, 0) else 1.0
-            reply_mult = REPLY_BONUS if replied_to_human else 1.0
-
+            
             base_gain = random.randint(XP_MIN, XP_MAX)
-            level_bonus = int(current_level * 0.5)
-
+            level_bonus = int(current_level * 0.5) 
+            gain = base_gain + level_bonus
+            
             global_xp = float(db.get_setting("global_xp_mult", "1.0"))
             tot_xp_buff = 1.0
             if now < data.get("xp_buff_end", 0):
                 tot_xp_buff = data.get("xp_buff_value", 1.0)
-
-            event_mult = combine_xp_multipliers(global_xp, tot_xp_buff)
-            gain = int((base_gain + level_bonus) * quality * fatigue * company_mult * suspicious_mult * reply_mult * event_mult)
+                
+            gain = int(gain * global_xp * tot_xp_buff)
             gain = max(1, gain)
-
-            count_for_mups = (suspicious_mult == 1.0 and gains_last_hour < MUPS_ELIGIBLE_PER_HOUR)
-
-            next_xp_time[key] = now_f + random.uniform(*XP_COOLDOWN_RANGE)
+            
+            count_for_mups = (gains_last_hour < MUPS_ELIGIBLE_PER_HOUR)
+            
+            last_xp_time[key] = now_f + random.uniform(*XP_COOLDOWN_RANGE)
             history.append(now)
 
     has_booster = any("CERTIFIED PAWBOOSTER" in r.name.upper() for r in member.roles)
@@ -1132,7 +1021,7 @@ async def on_message(message: discord.Message):
     old_xp, new_xp, _mups = db.add_message(message.guild.id, member.id, pings, gain, counted, booster_mult, count_for_mups)
     old_level = level_from_xp(old_xp)[0]
     new_level = level_from_xp(new_xp)[0]
-
+    
     if new_level > old_level:
         granted = await sync_level_roles(member, new_level)
         text = f"{member.mention} just reached **level {new_level}**!"
@@ -1182,8 +1071,6 @@ async def profile(interaction: discord.Interaction, member: discord.Member | Non
             break
 
     colour = target_member.colour if target_member.colour.value else PINK
-    
-    # ВОЗВРАЩЕНЫ ТОЧНЫЕ ЦИФРЫ ОПЫТА, ЧТОБЫ БЫЛО ВИДНО ПРОГРЕСС
     percent = int(100 * into_level / needed) if needed else 0
     embed = discord.Embed(
         title=f"{target_member.display_name}'s profile",
@@ -1244,7 +1131,7 @@ def build_leaderboard_embed(guild: discord.Guild, kind: str) -> discord.Embed:
     for user_id, xp, messages, voice_seconds in rows:
         member = guild.get_member(user_id)
         if member is None: continue
-        if kind == "xp": value = f"Level {level_from_xp(xp)[0]}"
+        if kind == "xp": value = f"Level {level_from_xp(xp)[0]} | {xp:,} XP"
         elif kind == "messages": value = f"{messages:,} messages"
         else: value = format_duration(voice_seconds)
         lines.append(f"**#{len(lines) + 1}** {member.display_name} | {value}")

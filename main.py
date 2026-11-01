@@ -155,6 +155,8 @@ DAILY_BASE_MUPS = 0.5
 DAILY_BASE_VUPS = 0.1
 DAILY_MUPS_STEP = 0.01                 # per streak day
 DAILY_VUPS_STEP = 0.01                 # per 2 streak days
+DAILY_BASE_XP = 1                      # XP from /daily at streak 1
+DAILY_XP_STEP = 0.5                    # +0.5 XP every 2 streak days
 
 WEEK_SECONDS = 7 * 24 * 3600
 
@@ -505,6 +507,21 @@ class Database:
             "SELECT user_id FROM treats WHERE guild_id = ? AND treat = ? AND count > 0", (guild_id, treat)
         ).fetchall()
         return [row[0] for row in rows]
+
+    def treat_holders(self, guild_id: int, treat: str):
+        """[(user_id, copies)] for everyone who owns the treat, most copies first."""
+        return self.conn.execute(
+            "SELECT user_id, count FROM treats WHERE guild_id = ? AND treat = ? AND count > 0 ORDER BY count DESC",
+            (guild_id, treat),
+        ).fetchall()
+
+    def treat_stats(self, guild_id: int, limit: int):
+        """[(user_id, different treats, total copies)] best collectors first."""
+        return self.conn.execute(
+            "SELECT user_id, COUNT(*), SUM(count) FROM treats WHERE guild_id = ? AND count > 0 "
+            "GROUP BY user_id ORDER BY COUNT(*) DESC, SUM(count) DESC LIMIT ?",
+            (guild_id, limit),
+        ).fetchall()
 
     def tot_has_starter(self, guild_id: int, user_id: int) -> bool:
         self._ensure(guild_id, user_id)
@@ -1175,6 +1192,7 @@ class SillyBot(discord.Client):
         self.add_view(VerifyView())
         self.add_view(CreateVoiceView())
         self.add_view(GetRolesView())
+        self.add_view(InventoryView())
         voice_tracker.start()
         voice_cleanup.start()
         mute_checker.start()
@@ -1337,7 +1355,7 @@ TRICK_SUCCESS_CHANCE = 0.5      # a Trick works 50% of the time
 GHOST_MARSHMALLOW_REDUCTION = 0.05
 TRICK_XP_PERCENT = 20           # a Trick can steal this % of the XP progress inside the current level
 TRICK_CURRENCY_RANGE = (10, 20)
-TREAT_REPEAT_CHANCE = 0.70      # a Treat gives a copy of something you already own 70% of the time
+TREAT_REPEAT_CHANCE = 0.70      # a Treat is a repeat (the receiver already owns it) 70% of the time, when the giver has one
 LMAO_CHANCE = 0.01
 GHOST_CHANCE = 0.01
 TREAT_END_REWARD_MUPS = 5       # Mups per collected treat when the event ends
@@ -1392,13 +1410,18 @@ def gumdrop_refund(guild_id: int, user_id: int, mups: float, vups: float) -> str
 
 # --- game rules (no Discord needed) ---
 def resolve_treat(guild_id: int, knocker_id: int, target_id: int) -> dict:
-    """The target gives the knocker a treat. 70% of the time it is a copy of one they already own."""
-    owned = db.get_treats(guild_id, knocker_id)
-    new_pool = [key for key in TREAT_KEYS if key not in owned]
-    if new_pool and (not owned or random.random() >= TREAT_REPEAT_CHANCE):
-        key = random.choice(new_pool)
+    """The target (giver) gives the knocker a copy of one of the GIVER's OWN treats.
+    70% of the time it is one the knocker already owns (a repeat), if the giver has such a treat."""
+    mine = db.get_treats(guild_id, target_id)
+    if not mine:
+        return {"treat": None, "is_new": False, "count": 0, "lmao": False}
+    theirs = db.get_treats(guild_id, knocker_id)
+    repeat_pool = [key for key in mine if key in theirs]
+    new_pool = [key for key in mine if key not in theirs]
+    if repeat_pool and (not new_pool or random.random() < TREAT_REPEAT_CHANCE):
+        key = random.choice(repeat_pool)
     else:
-        key = random.choice(list(owned))
+        key = random.choice(new_pool)
     is_new = db.add_treat(guild_id, knocker_id, key)
     count = db.get_treats(guild_id, knocker_id).get(key, 1)
     db.add_karma(guild_id, target_id, KARMA_TREAT)
@@ -2096,13 +2119,21 @@ async def daily(interaction: discord.Interaction):
     mult = (1.5 if has_booster else 1.0) * float(db.get_setting("global_curr_mult", "1.0")) * treat_currency_mult(treats)
     mups, vups = round(mups * mult, 2), round(vups * mult, 2)
 
+    # XP: 1 at first, +0.5 every 2 streak days. Halves are kept and paid out as whole XP.
+    xp_exact = DAILY_BASE_XP + DAILY_XP_STEP * ((new_streak - 1) // 2)
+    total_xp = xp_exact + db.get_flag(guild_id, member.id, "xp_frac")
+    whole_xp = int(total_xp)
+    db.set_flag(guild_id, member.id, "xp_frac", round(total_xp - whole_xp, 2))
+
     db.add_currency(guild_id, member.id, mups, vups)
     db.set_flag(guild_id, member.id, "daily_last", now)
     db.set_flag(guild_id, member.id, "daily_streak", new_streak)
+    if whole_xp:
+        await give_xp(member, whole_xp)
 
     embed = discord.Embed(
         title="Daily reward collected!",
-        description=f"Streak x{new_streak}\nYou gain {fmt_num(mups)} of Mups and {fmt_num(vups)} of Vups!",
+        description=f"Streak x{new_streak}\nYou gain {fmt_num(mups)} of Mups and {fmt_num(vups)} of Vups!\nAlso +{fmt_num(xp_exact)} XP.",
         colour=PINK,
     )
     embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
@@ -2180,8 +2211,11 @@ class KnockView(discord.ui.View):
 
         guild = interaction.guild
         result = resolve_treat(guild.id, self.knocker.id, self.target.id)
-        name = treat_name(result["treat"])
         knocker, target = self.knocker.mention, self.target.mention
+        if result["treat"] is None:
+            await self.show_result(f"{target} chose **Treat**, but has no treats to give yet. The thought counts!")
+            return
+        name = treat_name(result["treat"])
 
         if result["is_new"]:
             text = f"{target} chose **Treat** and gave {knocker} a brand new treat: **{name}**! (+{KARMA_TREAT} karma)"
@@ -2307,6 +2341,24 @@ async def knock_knock(interaction: discord.Interaction, user: discord.Member):
     )
     view.message = await interaction.original_response()
 
+def treat_grid(names: list[str]) -> str:
+    """Treat names in rows of three."""
+    if not names: return "Nothing here"
+    rows = [", ".join(names[i:i + 3]) for i in range(0, len(names), 3)]
+    return ",\n".join(rows)
+
+def build_buffs_embed() -> discord.Embed:
+    lines = [f"**{name}**\n*{TREAT_INFO[key]}*" for key, name in TREATS]
+    return discord.Embed(title="Treat Buffs", description="\n\n".join(lines)[:4000], colour=CREAM)
+
+class InventoryView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Treats Buffs", style=discord.ButtonStyle.primary, custom_id="inventory_buffs_button")
+    async def buffs(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(embed=build_buffs_embed(), ephemeral=True)
+
 @client.tree.command(name="inventory", description="See your treat collection, or someone else's")
 @app_commands.describe(user="Whose inventory to show (leave empty for your own)")
 @app_commands.guild_only()
@@ -2318,23 +2370,64 @@ async def inventory(interaction: discord.Interaction, user: discord.Member | Non
     guild_id = interaction.guild.id
     ensure_treat_starter(guild_id, target.id)
     owned = db.get_treats(guild_id, target.id)
-    mine = target.id == interaction.user.id
 
-    lines = []
-    for key, name in TREATS:
-        count = owned.get(key, 0)
-        if count:
-            status = f"You have this treat! ({count})" if mine else f"Has this treat! ({count})"
-        else:
-            status = "You never had this" if mine else "Never had this"
-        lines.append(f"**{name}** - {status}\n*{TREAT_INFO[key]}*")
+    owned_names = [f"{name} (x{owned[key]})" if owned[key] > 1 else name for key, name in TREATS if key in owned]
+    missing_names = [name for key, name in TREATS if key not in owned]
 
     embed = discord.Embed(
-        title=f"{target.display_name}'s inventory",
-        description="\n\n".join(lines)[:4000],
+        title=f"{target.display_name}'s Inventory",
+        description=(
+            f"**Treats Owned -**\n{treat_grid(owned_names)}\n\n"
+            f"**Treats Missing -**\n{treat_grid(missing_names)}\n\n"
+            f"**{len(owned)}/{len(TREAT_KEYS)}**\n"
+            f"Karma {db.get_karma(guild_id, target.id)}"
+        ),
         colour=CREAM,
     )
-    embed.set_footer(text=f"Collected {len(owned)}/{len(TREAT_KEYS)} treats | Karma {db.get_karma(guild_id, target.id)}")
+    await interaction.response.send_message(embed=embed, view=InventoryView())
+
+search_group = app_commands.Group(name="search", description="Search the server", guild_only=True)
+
+@search_group.command(name="treat", description="See who owns a treat")
+@app_commands.describe(treat="Which treat to look for")
+@app_commands.choices(treat=[app_commands.Choice(name=name, value=key) for key, name in TREATS])
+async def search_treat(interaction: discord.Interaction, treat: str):
+    guild = interaction.guild
+    lines = []
+    total = 0
+    for user_id, copies in db.treat_holders(guild.id, treat):
+        member = guild.get_member(user_id)
+        if member is None: continue
+        total += 1
+        if len(lines) < 30:
+            lines.append(f"**#{len(lines) + 1}** {member.display_name} | x{copies}")
+    if total > len(lines):
+        lines.append(f"...and {total - len(lines)} more")
+    embed = discord.Embed(
+        title=f"Who has {treat_name(treat)}?",
+        description="\n".join(lines) if lines else "Nobody has this treat yet.",
+        colour=PINK,
+    )
+    embed.set_footer(text=f"{total} critter{'s' if total != 1 else ''} with this treat")
+    await interaction.response.send_message(embed=embed)
+
+client.tree.add_command(search_group)
+
+@client.tree.command(name="treatboard", description="Shows who collected the most treats")
+@app_commands.guild_only()
+async def treatboard(interaction: discord.Interaction):
+    guild = interaction.guild
+    lines = []
+    for user_id, different, copies in db.treat_stats(guild.id, 50):
+        member = guild.get_member(user_id)
+        if member is None: continue
+        lines.append(f"**#{len(lines) + 1}** {member.display_name} | {different}/{len(TREAT_KEYS)} treats ({copies} in total)")
+        if len(lines) == 10: break
+    embed = discord.Embed(
+        title="Treat Leaderboard",
+        description="\n".join(lines) if lines else "Nobody has treats yet. Use /knock-knock!",
+        colour=PINK,
+    )
     await interaction.response.send_message(embed=embed)
 
 @client.tree.command(name="karmastats", description="See your karma and the kindest critters")

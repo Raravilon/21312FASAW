@@ -1,3 +1,4 @@
+import asyncio
 import os
 import random
 import re
@@ -23,6 +24,9 @@ VERIFY_CHANNEL_ID = int(os.getenv("VERIFY_CHANNEL_ID", "1564405761105461379"))
 # Optional: channel for bot warnings to moderators (0 = look for a channel
 # named "mod-log" or "moderator-only")
 MOD_LOG_CHANNEL_ID = int(os.getenv("MOD_LOG_CHANNEL_ID", "0"))
+# Event channels: 0 = look for a channel whose name contains "general" / "treat-pot"
+GENERAL_CHANNEL_ID = int(os.getenv("1564791988010881034", "0"))
+TREAT_POT_CHANNEL_ID = int(os.getenv("1566554951172366416", "0"))
 
 JOINED_ROLE_NAME = os.getenv("JOINED_ROLE_NAME", "Just joined!")
 NEWCOMER_ROLE_NAME = os.getenv("NEWCOMER_ROLE_NAME", "Newcomer :3")
@@ -273,6 +277,35 @@ class Database:
                 kind TEXT NOT NULL,
                 due INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, user_id, kind)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS boxes (
+                message_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                claimed_by INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pot (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                treats INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS earned_roles (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                role_name TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id, role_name)
             )
             """
         )
@@ -637,6 +670,67 @@ class Database:
         )
         self.conn.commit()
 
+    # ----- event part 3: mystery boxes, treat pot, earned event roles -----
+    def add_box(self, message_id: int, channel_id: int):
+        self.conn.execute("INSERT OR IGNORE INTO boxes (message_id, channel_id) VALUES (?, ?)", (message_id, channel_id))
+        self.conn.commit()
+
+    def claim_box(self, message_id: int, user_id: int) -> bool:
+        cursor = self.conn.execute(
+            "UPDATE boxes SET claimed_by = ? WHERE message_id = ? AND claimed_by = 0", (user_id, message_id)
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def treats_of_others(self, guild_id: int, user_id: int):
+        """[(user_id, treat)] for every treat copy owned by other people."""
+        return self.conn.execute(
+            "SELECT user_id, treat FROM treats WHERE guild_id = ? AND user_id != ? AND count > 0",
+            (guild_id, user_id),
+        ).fetchall()
+
+    def remove_treats(self, guild_id: int, user_id: int, treat: str, amount: int):
+        self.conn.execute(
+            "UPDATE treats SET count = count - ? WHERE guild_id = ? AND user_id = ? AND treat = ?",
+            (amount, guild_id, user_id, treat),
+        )
+        self.conn.execute(
+            "DELETE FROM treats WHERE guild_id = ? AND user_id = ? AND treat = ? AND count <= 0",
+            (guild_id, user_id, treat),
+        )
+        self.conn.commit()
+
+    def pot_add(self, guild_id: int, user_id: int, amount: int):
+        self.conn.execute("INSERT OR IGNORE INTO pot (guild_id, user_id, treats) VALUES (?, ?, 0)", (guild_id, user_id))
+        self.conn.execute("UPDATE pot SET treats = treats + ? WHERE guild_id = ? AND user_id = ?", (amount, guild_id, user_id))
+        self.conn.commit()
+
+    def pot_totals(self, guild_id: int):
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(treats), 0), COUNT(*) FROM pot WHERE guild_id = ? AND treats > 0", (guild_id,)
+        ).fetchone()
+        return row[0], row[1]
+
+    def pot_list(self, guild_id: int):
+        return self.conn.execute("SELECT user_id, treats FROM pot WHERE guild_id = ? AND treats > 0", (guild_id,)).fetchall()
+
+    def pot_clear(self, guild_id: int):
+        self.conn.execute("DELETE FROM pot WHERE guild_id = ?", (guild_id,))
+        self.conn.commit()
+
+    def mark_earned(self, guild_id: int, user_id: int, role_name: str):
+        self.conn.execute(
+            "INSERT OR IGNORE INTO earned_roles (guild_id, user_id, role_name) VALUES (?, ?, ?)",
+            (guild_id, user_id, role_name),
+        )
+        self.conn.commit()
+
+    def earned_roles(self, guild_id: int, user_id: int) -> set:
+        rows = self.conn.execute(
+            "SELECT role_name FROM earned_roles WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+        ).fetchall()
+        return {row[0] for row in rows}
+
 db = Database(DB_PATH)
 
 # ======================================================================
@@ -910,6 +1004,7 @@ class RolesPanelView(discord.ui.View):
                 if role: group[label] = role
             if not any(group.values()): continue
             self.add_item(RoleGroupSelect(member, group, placeholder, multiple, row))
+        add_event_role_select(self, member, 3)
 
 class EmojiSelect(discord.ui.Select):
     def __init__(self, member: discord.Member, guild: discord.Guild):
@@ -919,7 +1014,7 @@ class EmojiSelect(discord.ui.Select):
         all_items = []
         for cat_data in SHOP_CATEGORIES.values():
             all_items.extend(cat_data["items"])
-        all_items.extend(EVENT_NAME_EMOJIS)   # event-only name emojis (not sold in the shop)
+        pass   # event-only name emojis (not sold in the shop)
 
         seen = set()
         default_used = False
@@ -1009,6 +1104,7 @@ class EditProfilePanel(discord.ui.View):
 
         self.add_item(EmojiSelect(member, guild))
         self.add_item(EditNameButton())
+        add_event_role_select(self, member, 4)
 
 class ProfileView(discord.ui.View):
     def __init__(self, member: discord.Member):
@@ -1223,11 +1319,14 @@ class SillyBot(discord.Client):
         self.add_view(CreateVoiceView())
         self.add_view(GetRolesView())
         self.add_view(InventoryView())
+        self.add_view(MysteryBoxView())
+        self.add_view(TreatPotView())
         voice_tracker.start()
         voice_cleanup.start()
         mute_checker.start()
         reminder_loop.start()
         treat_weekly.start()
+        mystery_box_loop.start()
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
@@ -1380,6 +1479,7 @@ EVENT_NAME_EMOJIS = [
     {"name": "Hornet Hallow", "role": HORNET_HALLOW_ROLE},
     {"name": "Lmao Hornet", "role": LMAO_HORNET_ROLE},
     {"name": "Ghostly", "role": GHOSTLY_ROLE},
+    {"name": "Witch", "role": "Witch"},
 ]
 
 TRICK_SUCCESS_CHANCE = 0.5      # a Trick works 50% of the time
@@ -1449,7 +1549,10 @@ def resolve_treat(guild_id: int, knocker_id: int, target_id: int) -> dict:
     theirs = db.get_treats(guild_id, knocker_id)
     repeat_pool = [key for key in mine if key in theirs]
     new_pool = [key for key in mine if key not in theirs]
-    if repeat_pool and (not new_pool or random.random() < TREAT_REPEAT_CHANCE):
+    repeat_chance = TREAT_REPEAT_CHANCE
+    if time.time() < db.get_flag(guild_id, knocker_id, "luck_end"):
+        repeat_chance = 1 - 0.60   # Treat luck!: new treat 30% -> 60%
+    if repeat_pool and (not new_pool or random.random() < repeat_chance):
         key = random.choice(repeat_pool)
     else:
         key = random.choice(new_pool)
@@ -1461,7 +1564,14 @@ def resolve_treat(guild_id: int, knocker_id: int, target_id: int) -> dict:
 
 def resolve_trick(guild_id: int, knocker_id: int, target_id: int, roll: float) -> dict:
     """The target (thief) tricks the knocker (victim). `roll` is a random number from 0 to 1."""
+    shield = int(db.get_flag(guild_id, knocker_id, "shield_n"))
+    if shield > 0:   # Ghost Shield: the trick fails and uses up one charge
+        db.set_flag(guild_id, knocker_id, "shield_n", shield - 1)
+        db.add_karma(guild_id, target_id, KARMA_TRICK_FAIL)
+        return {"success": False, "karma": KARMA_TRICK_FAIL, "shield": True}
     chance = TRICK_SUCCESS_CHANCE
+    if time.time() < db.get_flag(guild_id, target_id, "brew_end"):
+        chance = 0.80   # Thief's Brew
     if "ghost_marshmallow" in db.get_treats(guild_id, knocker_id):
         chance -= GHOST_MARSHMALLOW_REDUCTION
     if roll >= chance:
@@ -1844,6 +1954,8 @@ async def on_message(message: discord.Message):
         if "moon_caramel" in treats and is_night(): treat_xp *= 1.05
         if "cursed_candy_corn" in treats: treat_xp *= 0.98
         if now_f < db.get_flag(gid, member.id, "cobweb_boost_end"): treat_xp *= 1.05
+        if now_f < db.get_flag(gid, member.id, "strange_xp_end"):
+            treat_xp *= db.get_flag(gid, member.id, "strange_xp_mult", 1.0) or 1.0
 
         gain = int((base_gain + level_bonus) * quality * fatigue * company_mult * suspicious_mult * reply_mult * event_mult * treat_xp)
         gain = max(1, gain)
@@ -2314,7 +2426,10 @@ class KnockView(discord.ui.View):
         knocker, target = self.knocker.mention, self.target.mention
 
         if not result["success"]:
-            await self.show_result(f"{target} chose **Trick**... but {knocker} wasn't scared at all! The trick failed ~w~ ({KARMA_TRICK_FAIL} karma)")
+            if result.get("shield"):
+                await self.show_result(f"{target} chose **Trick**... but a **Ghost Shield** protected {knocker}! The trick failed ~w~ ({KARMA_TRICK_FAIL} karma)")
+            else:
+                await self.show_result(f"{target} chose **Trick**... but {knocker} wasn't scared at all! The trick failed ~w~ ({KARMA_TRICK_FAIL} karma)")
             return
 
         treat_text = f"**{treat_name(result['treat'])}**" if result["treat"] else None
@@ -2566,6 +2681,7 @@ async def tot_end(interaction: discord.Interaction):
     guild = interaction.guild
     db.set_setting("tot_active", "0")
     pending_knocks.clear()
+    await finish_treat_pot(guild)
 
     # Everyone gets a few Mups for every different treat in their collection
     rewarded = 0
@@ -3127,6 +3243,632 @@ async def hug(interaction: discord.Interaction, user: discord.Member):
 @app_commands.guild_only()
 async def pat(interaction: discord.Interaction, user: discord.Member):
     await run_action(interaction, "pat", user)
+
+# ======================================================================
+#  Event part 3: Mystery Box, Treat Pot, Witch's Cauldron, event roles
+# ======================================================================
+def find_text_channel(guild: discord.Guild, keyword: str, channel_id: int = 0):
+    """Channel by id (if set) or the first text channel whose name contains the keyword."""
+    if channel_id:
+        channel = guild.get_channel(channel_id)
+        if channel is not None: return channel
+    return discord.utils.find(
+        lambda c: isinstance(c, discord.TextChannel) and keyword in c.name.lower(), guild.channels
+    )
+
+# ---------------------------- Event roles in the profile ----------------------------
+class EventRoleSelect(discord.ui.Select):
+    """Lets people put their event roles on and off. Taken-off roles are remembered, so they can come back."""
+    def __init__(self, member: discord.Member, roles: list, row: int):
+        held = set(member.roles)
+        options = [discord.SelectOption(label=role.name[:100], value=str(role.id), default=(role in held))
+                   for role in roles]
+        super().__init__(placeholder="Show your event roles!", min_values=0, max_values=len(options),
+                         options=options, row=row)
+        self.event_roles = roles
+
+    async def callback(self, interaction: discord.Interaction):
+        member = interaction.user
+        chosen = {int(value) for value in self.values}
+        wanted = {role for role in self.event_roles if role.id in chosen}
+        held = set(member.roles)
+        to_add = list(wanted - held)
+        to_remove = list((set(self.event_roles) & held) - wanted)
+        for role in to_remove:
+            db.mark_earned(member.guild.id, member.id, role.name)
+        try:
+            if to_add: await member.add_roles(*to_add, reason="Event roles")
+            if to_remove: await member.remove_roles(*to_remove, reason="Event roles")
+        except (discord.Forbidden, discord.HTTPException):
+            await interaction.response.send_message("I can't change those roles. Please tell a mod to move my role higher.", ephemeral=True)
+            return
+        for option in self.options:
+            option.default = int(option.value) in chosen
+        await interaction.response.edit_message(content="Saved! You can change this any time.", view=self.view)
+
+def add_event_role_select(view: discord.ui.View, member: discord.Member, row: int):
+    earned = db.earned_roles(member.guild.id, member.id)
+    roles, seen = [], set()
+    for entry in EVENT_NAME_EMOJIS:
+        role = find_role(member.guild, entry["role"])
+        if role is None or role.id in seen: continue
+        if role in member.roles or entry["role"] in earned:
+            seen.add(role.id)
+            roles.append(role)
+    if roles:
+        view.add_item(EventRoleSelect(member, roles, row))
+
+
+# ---------------------------- Mystery box ----------------------------
+BOX_INTERVAL = 600     # a new box every 10 minutes while the event runs
+BOX_OUTCOMES = [("nothing", 12), ("mups", 23), ("xp", 18), ("shop", 9),
+                ("treat", 14), ("steal", 9), ("lose", 7), ("bomb", 8)]
+BOX_ALL_TREATS_MUPS = 100
+
+def box_embed(text: str) -> discord.Embed:
+    return discord.Embed(title="Mystery box", description=text, colour=PINK)
+
+async def post_mystery_box(guild: discord.Guild) -> bool:
+    channel = find_text_channel(guild, "general", GENERAL_CHANNEL_ID)
+    if channel is None: return False
+    try:
+        message = await channel.send(
+            embed=box_embed("**Wowwie! Strange cat left mysterious box here!**"), view=MysteryBoxView()
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        return False
+    db.add_box(message.id, channel.id)
+    return True
+
+async def run_box(interaction: discord.Interaction):
+    guild = interaction.guild
+    member = interaction.user
+    message = interaction.message
+    channel = message.channel
+    mention = member.mention
+
+    async def show(text: str):
+        try: await interaction.edit_original_response(embed=box_embed(text), view=None)
+        except (discord.NotFound, discord.HTTPException): pass
+
+    outcome = random.choices([k for k, _ in BOX_OUTCOMES], weights=[w for _, w in BOX_OUTCOMES])[0]
+
+    if outcome == "shop":
+        pool = [item for cat in get_active_shop_categories().values() for item in cat["items"] if item["key"] != "wyphlet"]
+        random.shuffle(pool)
+        for item in pool:
+            role = find_shop_role(guild, item["role"])
+            if role is None or role in member.roles: continue
+            try: await member.add_roles(role, reason="Mystery box")
+            except (discord.Forbidden, discord.HTTPException): continue
+            await show(f"There was **{item['name']}** in the box, congratulations {mention}!")
+            return
+        outcome = "mups"
+
+    if outcome == "treat":
+        owned = db.get_treats(guild.id, member.id)
+        missing = [key for key in TREAT_KEYS if key not in owned]
+        if missing:
+            key = random.choice(missing)
+            db.add_treat(guild.id, member.id, key)
+            text = f"{mention}, there was a **{treat_name(key)}** treat! Yay!!"
+            if await check_hornet_hallow(guild, member):
+                text += f"\n{mention} collected every treat and became a **{HORNET_HALLOW_ROLE}**!"
+            await show(text)
+            return
+        db.add_currency(guild.id, member.id, BOX_ALL_TREATS_MUPS, 0)
+        await show(f"{mention}, you already have every treat, so the box gave you **{BOX_ALL_TREATS_MUPS} Mups** instead!")
+        return
+
+    if outcome == "steal":
+        mine = db.get_treats(guild.id, member.id)
+        options = [(uid, key) for uid, key in db.treats_of_others(guild.id, member.id)
+                   if key not in mine and guild.get_member(uid) is not None]
+        if options:
+            uid, key = random.choice(options)
+            victim = guild.get_member(uid)
+            db.remove_treat(guild.id, uid, key)
+            db.add_treat(guild.id, member.id, key)
+            text = f"{mention} sneaked a **{treat_name(key)}** treat out of {victim.mention}'s pocket!"
+            if await check_hornet_hallow(guild, member):
+                text += f"\n{mention} collected every treat and became a **{HORNET_HALLOW_ROLE}**!"
+            await show(text)
+            return
+        outcome = "mups"
+
+    if outcome == "lose":
+        others = [m for m in guild.members if not m.bot and m.id != member.id]
+        if not others:
+            outcome = "nothing"
+        else:
+            other = random.choice(others)
+            taken = db.steal_currency(guild.id, member.id, other.id, random.randint(10, 40), "mups")
+            if taken:
+                await show(f"{mention}, you lost {fmt_num(taken)} Mups! They were given to {other.mention}")
+            else:
+                await show(f"A paw reached out to take {mention}'s Mups, but the pockets were empty!")
+            return
+
+    if outcome == "bomb":
+        for number in (5, 4, 3, 2, 1):
+            await show(f"BOMB... IT EXPLODES IN {number}")
+            await asyncio.sleep(1)
+        removed = 0
+        try:
+            doomed = []
+            async for old in channel.history(limit=50):
+                if old.id == message.id or old.pinned: continue
+                doomed.append(old)
+                if len(doomed) == 10: break
+            if len(doomed) >= 2: await channel.delete_messages(doomed)
+            elif doomed: await doomed[0].delete()
+            removed = len(doomed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        text = f"BOOM! {mention} opened a bomb!"
+        if removed: text += f" The last {removed} messages were blown away."
+        await show(text)
+        return
+
+    if outcome == "xp":
+        await give_xp(member, 200)
+        await show(f"{mention} !! 200 xp was in this box! Great ^^")
+    elif outcome == "nothing":
+        await show(f"{mention} ... There was nothing.. sadly ~w~..")
+    else:   # mups
+        amount = random.randint(10, 100)
+        db.add_currency(guild.id, member.id, amount, 0)
+        await show(f"Wow {mention}!! You found {amount} Mups!")
+
+class MysteryBoxView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Open", style=discord.ButtonStyle.primary, custom_id="mystery_box_open")
+    async def open_box(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not db.claim_box(interaction.message.id, interaction.user.id):
+            await interaction.response.send_message("Someone was faster, this box is already open!", ephemeral=True)
+            return
+        await interaction.response.defer()
+        try:
+            await run_box(interaction)
+        except Exception as error:
+            print(f"Mystery box failed: {error!r}")
+            try:
+                await interaction.edit_original_response(
+                    embed=box_embed("The box fell apart... nothing came out. Sowwee ~w~"), view=None)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+@tasks.loop(seconds=30)
+async def mystery_box_loop():
+    guild = client.get_guild(GUILD_ID)
+    if guild is None or not tot_is_active(): return
+    now = time.time()
+    if now - float(db.get_setting("box_last", "0")) < BOX_INTERVAL: return
+    db.set_setting("box_last", str(now))
+    await post_mystery_box(guild)
+
+@mystery_box_loop.before_loop
+async def before_mystery_box_loop():
+    await client.wait_until_ready()
+
+spawn_group = app_commands.Group(
+    name="spawn", description="Spawn event things (admins only)",
+    default_permissions=discord.Permissions(administrator=True), guild_only=True,
+)
+
+@spawn_group.command(name="box", description="Spawn a mystery box right now (does not change the 10 minute timer)")
+async def spawn_box(interaction: discord.Interaction):
+    if not is_server_admin(interaction):
+        await interaction.response.send_message("Only the server creator or admins can do this.", ephemeral=True)
+        return
+    if await post_mystery_box(interaction.guild):
+        await interaction.response.send_message("The box was spawned.", ephemeral=True)
+    else:
+        await interaction.response.send_message("I couldn't post in the general channel.", ephemeral=True)
+
+client.tree.add_command(spawn_group)
+
+
+# ---------------------------- Treat Pot ----------------------------
+POT_XP, POT_MUPS, POT_VUPS = 15, 3, 2     # one treat in the pot
+
+def pot_pools(treats: int) -> tuple[int, int, int]:
+    return treats * POT_XP, treats * POT_MUPS, treats * POT_VUPS
+
+def build_pot_embed(guild_id: int, closed: bool = False) -> discord.Embed:
+    treats, investors = db.pot_totals(guild_id)
+    xp_pool, mups_pool, vups_pool = pot_pools(treats)
+    xp_each = xp_pool // investors if investors else 0
+    mups_each = round(mups_pool / investors, 2) if investors else 0
+    vups_each = round(vups_pool / investors, 2) if investors else 0
+    embed = discord.Embed(
+        title="TREAT POT" + (" (closed)" if closed else ""),
+        description="Put your treats here! At the end of the event, all treats will turn into XP, Mups and Vups! "
+                    "Then split equally between everyone who invested their treats!",
+        colour=CREAM,
+    )
+    embed.add_field(name="Treats", value=f"{treats:,}", inline=True)
+    embed.add_field(name="Investors", value=f"{investors:,}", inline=True)
+    embed.add_field(name="\u200b", value="\u200b", inline=True)
+    embed.add_field(name="Xp Per user", value=f"{xp_each:,}", inline=True)
+    embed.add_field(name="Mups Per user", value=fmt_num(mups_each), inline=True)
+    embed.add_field(name="Vups Per user", value=fmt_num(vups_each), inline=True)
+    embed.set_footer(text=f"Treats Calculation: 1 treat = {POT_XP} XP, {POT_MUPS} Mups, {POT_VUPS} Vups")
+    return embed
+
+async def update_pot_message(guild: discord.Guild, closed: bool = False):
+    channel_id = int(db.get_setting("pot_channel", "0"))
+    message_id = int(db.get_setting("pot_message", "0"))
+    channel = guild.get_channel(channel_id) if channel_id else None
+    if channel is None or not message_id: return
+    try:
+        message = await channel.fetch_message(message_id)
+        await message.edit(embed=build_pot_embed(guild.id, closed), view=None if closed else TreatPotView())
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
+class PotTreatSelect(discord.ui.Select):
+    def __init__(self, pot: "PotInsertView", owned: dict):
+        options = [discord.SelectOption(label=f"{name} (x{owned[key]})", value=key, default=(key == pot.treat))
+                   for key, name in TREATS if key in owned]
+        super().__init__(placeholder="Pick a treat to insert", options=options[:25], row=0)
+        self.pot = pot
+
+    async def callback(self, interaction: discord.Interaction):
+        self.pot.treat = self.values[0]
+        self.pot.amount = None
+        self.pot.build()
+        await interaction.response.edit_message(embed=self.pot.make_embed(), view=self.pot)
+
+class PotAmountSelect(discord.ui.Select):
+    def __init__(self, pot: "PotInsertView", count: int):
+        options = [discord.SelectOption(label=str(i), value=str(i), default=(i == pot.amount))
+                   for i in range(1, min(count, 25) + 1)]
+        super().__init__(placeholder="Pick an amount", options=options, row=1)
+        self.pot = pot
+
+    async def callback(self, interaction: discord.Interaction):
+        self.pot.amount = int(self.values[0])
+        self.pot.build()
+        await interaction.response.edit_message(embed=self.pot.make_embed(), view=self.pot)
+
+class PotConfirmButton(discord.ui.Button):
+    def __init__(self, pot: "PotInsertView"):
+        super().__init__(label="Insert!", style=discord.ButtonStyle.success, row=2)
+        self.pot = pot
+
+    async def callback(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        member = interaction.user
+        if not tot_is_active():
+            await interaction.response.edit_message(embed=discord.Embed(description="The pot is closed.", colour=CREAM), view=None)
+            return
+        have = db.get_treats(guild.id, member.id).get(self.pot.treat, 0)
+        amount = min(self.pot.amount, have)
+        if amount <= 0:
+            await interaction.response.edit_message(embed=discord.Embed(description="You don't have that treat anymore.", colour=CREAM), view=None)
+            return
+        db.remove_treats(guild.id, member.id, self.pot.treat, amount)
+        db.pot_add(guild.id, member.id, amount)
+        await interaction.response.edit_message(
+            embed=discord.Embed(description=f"You put {amount}x **{treat_name(self.pot.treat)}** into the pot. Thank you!", colour=PINK),
+            view=None,
+        )
+        await update_pot_message(guild)
+
+class PotInsertView(discord.ui.View):
+    def __init__(self, member: discord.Member):
+        super().__init__(timeout=300)
+        self.member = member
+        self.treat: str | None = None
+        self.amount: int | None = None
+        self.build()
+
+    def build(self):
+        self.clear_items()
+        owned = db.get_treats(self.member.guild.id, self.member.id)
+        self.add_item(PotTreatSelect(self, owned))
+        if self.treat and owned.get(self.treat, 0) > 0:
+            self.add_item(PotAmountSelect(self, owned[self.treat]))
+            if self.amount:
+                self.add_item(PotConfirmButton(self))
+
+    def make_embed(self) -> discord.Embed:
+        text = "Pick a treat to insert, then pick an amount.\nInserted treats are gone for good, and so are their buffs."
+        if self.treat: text += f"\n\nTreat: **{treat_name(self.treat)}**"
+        if self.amount: text += f"\nAmount: **{self.amount}**"
+        return discord.Embed(title="Insert a treat", description=text, colour=CREAM)
+
+class TreatPotView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Insert a treat!", style=discord.ButtonStyle.success, custom_id="treat_pot_insert")
+    async def insert(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not tot_is_active():
+            await interaction.response.send_message("The pot is closed.", ephemeral=True)
+            return
+        if not db.get_treats(interaction.guild.id, interaction.user.id):
+            await interaction.response.send_message("You don't have any treats to insert.", ephemeral=True)
+            return
+        view = PotInsertView(interaction.user)
+        await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
+
+@client.tree.command(name="treat_pot_setup", description="Post the Treat Pot message in the treat-pot channel (admins only)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def treat_pot_setup(interaction: discord.Interaction):
+    if not is_server_admin(interaction):
+        await interaction.response.send_message("Only the server creator or admins can do this.", ephemeral=True)
+        return
+    guild = interaction.guild
+    channel = find_text_channel(guild, "treat-pot", TREAT_POT_CHANNEL_ID)
+    if channel is None:
+        await interaction.response.send_message("I can't find the treat-pot channel.", ephemeral=True)
+        return
+    try:
+        message = await channel.send(embed=build_pot_embed(guild.id), view=TreatPotView())
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.response.send_message("I can't post in that channel.", ephemeral=True)
+        return
+    db.set_setting("pot_channel", str(channel.id))
+    db.set_setting("pot_message", str(message.id))
+    await interaction.response.send_message(f"Treat Pot posted in {channel.mention}.", ephemeral=True)
+
+async def finish_treat_pot(guild: discord.Guild):
+    """Turns the pot into XP, Mups and Vups, splits it equally between the investors and announces it."""
+    treats, investors = db.pot_totals(guild.id)
+    channel = find_text_channel(guild, "treat-pot", TREAT_POT_CHANNEL_ID)
+    if treats == 0 or investors == 0:
+        db.pot_clear(guild.id)
+        await update_pot_message(guild, closed=True)
+        return
+
+    xp_pool, mups_pool, vups_pool = pot_pools(treats)
+    xp_each = xp_pool // investors
+    mups_each = round(mups_pool / investors, 2)
+    vups_each = round(vups_pool / investors, 2)
+
+    mentions = []
+    for user_id, _ in db.pot_list(guild.id):
+        db.add_currency(guild.id, user_id, mups_each, vups_each)
+        member = guild.get_member(user_id)
+        if member is not None:
+            await give_xp(member, xp_each)
+            mentions.append(member.mention)
+        else:
+            db.add_xp(guild.id, user_id, xp_each)
+    db.pot_clear(guild.id)
+
+    text = (f"Treats invested: {treats:,}\nXp in Pot: {xp_pool:,}\nMups In Pot: {mups_pool:,}\nVups in Pot: {vups_pool:,}\n\n"
+            f"You got: {xp_each:,} Xp, {fmt_num(mups_each)} Mups, {fmt_num(vups_each)} Vups.")
+    if mentions:
+        text += "\n\nInvestors: " + " ".join(mentions[:40]) + (" ..." if len(mentions) > 40 else "")
+    await update_pot_message(guild, closed=True)
+    if channel is not None:
+        try:
+            await channel.send(
+                content="@here",
+                embed=discord.Embed(title="TREAT POT EVENT ENDED", description=text, colour=PINK),
+                allowed_mentions=discord.AllowedMentions(everyone=True),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
+# ---------------------------- Witch's Cauldron ----------------------------
+GHOSTLY_CRAFT_LIMIT = 3
+WITCH_ROLE = "Witch"
+
+CAULDRON_RECIPES = {
+    "treat_luck": {"name": "Treat luck!",
+                   "desc": "Buff for 2 hours: while it lasts, your chance of getting a new treat from a Treat is 30% -> 60%.",
+                   "cost": {"pumpkin_cookie": 2, "gloomy_gumdrop": 2}},
+    "ghostly": {"name": "Ghostly Role",
+                "desc": f"Ghost that somehow became a server role.. Only {GHOSTLY_CRAFT_LIMIT} users can obtain this!",
+                "cost": {"ghost_marshmallow": 3, "mummy_muffin": 2}},
+    "strange_xp": {"name": "Strange Xp Boost!",
+                   "desc": "It's.. an xp boost, but not at all..? (1 hour, a random multiplier from x0.5 to x3)",
+                   "cost": {"gloomy_gumdrop": 1}},
+    "witch": {"name": "Witch Role",
+              "desc": "Plehh.. A real witch??",
+              "cost": {"witch_hat_truffle": 4, "bat_wing_gummy": 2, "spooky_lollipop": 2}},
+    "thief_brew": {"name": "Thief's Brew",
+                   "desc": "Your chance to trick someone 50% -> 80% for 6 hours.",
+                   "cost": {"skeleton_biscuit": 2, "cauldron_cocoa": 1}},
+    "ghost_shield": {"name": "Ghost Shield",
+                     "desc": "Get a ghostly shield against the next 3 tricks on you!",
+                     "cost": {"skeleton_biscuit": 2, "ghost_marshmallow": 1}},
+}
+
+def cauldron_offers(now: float) -> list[tuple[str, dict]]:
+    """Changes every hour, and is the same for everybody: 2 random recipes and 1 random treat."""
+    rng = random.Random(int(now // 3600))
+    picks = rng.sample(list(CAULDRON_RECIPES), 2)
+    gives, cost = rng.sample(TREAT_KEYS, 2)
+    offers = [(key, CAULDRON_RECIPES[key]) for key in picks]
+    offers.append(("random_treat", {
+        "name": f"Random Treat: {treat_name(gives)}",
+        "desc": f"A very cool Treat to have! This hour it is {treat_name(gives)}.",
+        "cost": {cost: 2},
+        "gives": gives,
+    }))
+    return offers
+
+def cauldron_minutes_left(now: float) -> int:
+    return 60 - int((now % 3600) // 60)
+
+class CauldronSelect(discord.ui.Select):
+    def __init__(self, cauldron: "CauldronView", offers):
+        options = [discord.SelectOption(label=recipe["name"][:100], value=key, default=(key == cauldron.offer_key))
+                   for key, recipe in offers]
+        super().__init__(placeholder="Open Recipe", options=options, row=0)
+        self.cauldron = cauldron
+
+    async def callback(self, interaction: discord.Interaction):
+        self.cauldron.offer_key = self.values[0]
+        self.cauldron.notice = None
+        self.cauldron.build()
+        await interaction.response.edit_message(embed=self.cauldron.make_embed(), view=self.cauldron)
+
+class CauldronBackButton(discord.ui.Button):
+    def __init__(self, cauldron: "CauldronView"):
+        super().__init__(label="Back", style=discord.ButtonStyle.secondary, row=1)
+        self.cauldron = cauldron
+
+    async def callback(self, interaction: discord.Interaction):
+        self.cauldron.offer_key = None
+        self.cauldron.build()
+        await interaction.response.edit_message(embed=self.cauldron.make_embed(), view=self.cauldron)
+
+class CauldronCombineButton(discord.ui.Button):
+    def __init__(self, cauldron: "CauldronView"):
+        super().__init__(label="Combine!", style=discord.ButtonStyle.success, row=1)
+        self.cauldron = cauldron
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.cauldron
+        guild = interaction.guild
+        member = interaction.user
+        now = time.time()
+        offers = dict(cauldron_offers(now))
+
+        if view.offer_key not in offers:
+            view.offer_key = None
+            view.notice = "The cauldron was reset! Take a look at the new recipes."
+            view.build()
+            await interaction.response.edit_message(embed=view.make_embed(), view=view)
+            return
+
+        key = view.offer_key
+        recipe = offers[key]
+        owned = db.get_treats(guild.id, member.id)
+        missing = [f"{need - owned.get(treat, 0)}x {treat_name(treat)}"
+                   for treat, need in recipe["cost"].items() if owned.get(treat, 0) < need]
+        if missing:
+            await interaction.response.send_message("You are missing: " + ", ".join(missing), ephemeral=True)
+            return
+
+        # things that can be refused BEFORE we spend anything
+        if key == "ghostly":
+            ghostly = find_role(guild, GHOSTLY_ROLE)
+            if int(db.get_setting("ghostly_crafted", "0")) >= GHOSTLY_CRAFT_LIMIT:
+                await interaction.response.send_message("All Ghostly roles are taken already.", ephemeral=True)
+                return
+            if ghostly is not None and ghostly in member.roles:
+                await interaction.response.send_message("You already have the Ghostly role.", ephemeral=True)
+                return
+        if key == "witch":
+            witch = find_role(guild, WITCH_ROLE)
+            if witch is not None and witch in member.roles:
+                await interaction.response.send_message("You already have the Witch role.", ephemeral=True)
+                return
+
+        for treat, need in recipe["cost"].items():
+            db.remove_treats(guild.id, member.id, treat, need)
+
+        mention = member.mention
+        if key == "treat_luck":
+            db.set_flag(guild.id, member.id, "luck_end", now + 2 * 3600)
+            text = f"{mention} brewed **Treat luck!** For 2 hours you are much more likely to get new treats."
+        elif key == "strange_xp":
+            mult = round(random.uniform(0.5, 3.0), 2)
+            db.set_flag(guild.id, member.id, "strange_xp_end", now + 3600)
+            db.set_flag(guild.id, member.id, "strange_xp_mult", mult)
+            text = f"{mention} drank the **Strange Xp Boost!** Your XP is x{mult} for the next hour!"
+        elif key == "thief_brew":
+            db.set_flag(guild.id, member.id, "brew_end", now + 6 * 3600)
+            text = f"{mention} brewed **Thief's Brew!** Your tricks are much sneakier for 6 hours."
+        elif key == "ghost_shield":
+            left = int(db.get_flag(guild.id, member.id, "shield_n"))
+            db.set_flag(guild.id, member.id, "shield_n", left + 3)
+            text = f"{mention} got a **Ghost Shield!** The next {left + 3} tricks on you will fail."
+        elif key == "random_treat":
+            gives = recipe["gives"]
+            db.add_treat(guild.id, member.id, gives)
+            count = db.get_treats(guild.id, member.id).get(gives, 1)
+            text = f"{mention} combined their treats and got **{treat_name(gives)}**! Now they have {count}."
+            if await check_hornet_hallow(guild, member):
+                text += f"\n{mention} collected every treat and became a **{HORNET_HALLOW_ROLE}**!"
+        else:   # roles
+            role_name = GHOSTLY_ROLE if key == "ghostly" else WITCH_ROLE
+            crafted = int(db.get_setting("ghostly_crafted", "0"))
+            if key == "ghostly":
+                db.set_setting("ghostly_crafted", str(crafted + 1))   # reserve the spot before any await
+            if await grant_role_by_name(member, role_name, "Crafted in the Witch's cauldron"):
+                text = f"{mention} crafted the **{role_name}** role!"
+            else:
+                if key == "ghostly":
+                    db.set_setting("ghostly_crafted", str(crafted))
+                for treat, need in recipe["cost"].items():   # give everything back
+                    for _ in range(need): db.add_treat(guild.id, member.id, treat)
+                text = "I couldn't give you that role, so your treats were returned. Please tell a mod."
+
+        view.offer_key = None
+        view.notice = text
+        view.build()
+        await interaction.response.edit_message(embed=view.make_embed(), view=view)
+
+class CauldronView(discord.ui.View):
+    def __init__(self, member: discord.Member):
+        super().__init__(timeout=600)
+        self.member = member
+        self.offer_key: str | None = None
+        self.notice: str | None = None
+        self.build()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.member.id: return True
+        await interaction.response.send_message("This is not your cauldron! Type /witchs-cauldron to use your own.", ephemeral=True)
+        return False
+
+    def build(self):
+        self.clear_items()
+        offers = cauldron_offers(time.time())
+        self.add_item(CauldronSelect(self, offers))
+        if self.offer_key:
+            self.add_item(CauldronCombineButton(self))
+            self.add_item(CauldronBackButton(self))
+
+    def make_embed(self) -> discord.Embed:
+        now = time.time()
+        offers = dict(cauldron_offers(now))
+        minutes = cauldron_minutes_left(now)
+        reset = f"[Reset in {minutes} minute{'s' if minutes != 1 else ''}]"
+        notice = f"{self.notice}\n\n" if self.notice else ""
+
+        if self.offer_key in offers:
+            recipe = offers[self.offer_key]
+            owned = db.get_treats(self.member.guild.id, self.member.id)
+            lines, warnings = [], []
+            for treat, need in recipe["cost"].items():
+                have = owned.get(treat, 0)
+                lines.append(f"x{need} {treat_name(treat)} (you have {have})")
+                if have == need:
+                    warnings.append(f"Careful: this uses your last {treat_name(treat)}, and you will lose its buff.")
+            text = f"{notice}**{recipe['name']}** Recipe!\n\n" + "\n".join(lines)
+            if warnings: text += "\n\n" + "\n".join(warnings)
+            text += f"\n\n{reset}"
+        else:
+            parts = []
+            for key, recipe in cauldron_offers(now):
+                extra = ""
+                if key == "ghostly" and int(db.get_setting("ghostly_crafted", "0")) >= GHOSTLY_CRAFT_LIMIT:
+                    extra = " (sold out)"
+                parts.append(f"**{recipe['name']}**{extra}\n{recipe['desc']}")
+            text = (f"{notice}Combine your treats for buffs or other treats!\n\n"
+                    f"**What can you get** {reset}\n\n" + "\n\n".join(parts))
+        return discord.Embed(title="Witch's cauldron", description=text, colour=CREAM)
+
+@client.tree.command(name="witchs-cauldron", description="Combine your treats for buffs, roles and new treats")
+@app_commands.guild_only()
+async def witchs_cauldron(interaction: discord.Interaction):
+    # Everybody can see the message, but only the person who used the command can press the buttons
+    view = CauldronView(interaction.user)
+    await interaction.response.send_message(embed=view.make_embed(), view=view)
+
 
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN environment variable is not set")

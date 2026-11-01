@@ -2195,7 +2195,7 @@ async def give_xp_cmd(interaction: discord.Interaction, member: discord.Member, 
 @app_commands.describe(member="Target member", mups="Mups amount", vups="Vups amount")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
-async def give_currency(interaction: discord.Interaction, member: discord.Member, mups: float = 0, vups: float = 0):
+async def give_currency(interaction: discord.Interaction, member: discord.Member, mups: float = 0.0, vups: float = 0.0):
     if not is_server_admin(interaction):
         return await interaction.response.send_message("Admins only.", ephemeral=True)
     db.add_currency(interaction.guild.id, member.id, mups, vups)
@@ -2206,7 +2206,7 @@ async def give_currency(interaction: discord.Interaction, member: discord.Member
 @app_commands.describe(member="Target member", mups="Mups amount", vups="Vups amount")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
-async def take_currency_cmd(interaction: discord.Interaction, member: discord.Member, mups: float = 0, vups: float = 0):
+async def take_currency_cmd(interaction: discord.Interaction, member: discord.Member, mups: float = 0.0, vups: float = 0.0):
     if not is_server_admin(interaction):
         return await interaction.response.send_message("Admins only.", ephemeral=True)
     taken_m, taken_v = db.take_currency(interaction.guild.id, member.id, mups, vups)

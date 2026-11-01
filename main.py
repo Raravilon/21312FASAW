@@ -265,6 +265,17 @@ class Database:
             )
             """
         )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminders (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                due INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, user_id, kind)
+            )
+            """
+        )
         self.conn.commit()
 
     def get_setting(self, key: str, default: str) -> str:
@@ -605,6 +616,25 @@ class Database:
 
     def remove_mute(self, guild_id: int, user_id: int):
         self.conn.execute("DELETE FROM mutes WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+        self.conn.commit()
+
+    # ----- cooldown reminders -----
+    def set_reminder(self, guild_id: int, user_id: int, kind: str, due: int):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO reminders (guild_id, user_id, kind, due) VALUES (?, ?, ?, ?)",
+            (guild_id, user_id, kind, due),
+        )
+        self.conn.commit()
+
+    def due_reminders(self, guild_id: int, now: int):
+        return self.conn.execute(
+            "SELECT user_id, kind FROM reminders WHERE guild_id = ? AND due <= ?", (guild_id, now)
+        ).fetchall()
+
+    def remove_reminder(self, guild_id: int, user_id: int, kind: str):
+        self.conn.execute(
+            "DELETE FROM reminders WHERE guild_id = ? AND user_id = ? AND kind = ?", (guild_id, user_id, kind)
+        )
         self.conn.commit()
 
 db = Database(DB_PATH)
@@ -1196,6 +1226,7 @@ class SillyBot(discord.Client):
         voice_tracker.start()
         voice_cleanup.start()
         mute_checker.start()
+        reminder_loop.start()
         treat_weekly.start()
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
@@ -1624,6 +1655,36 @@ async def voice_cleanup():
 async def before_voice_cleanup():
     await client.wait_until_ready()
 
+REMINDER_TEXT = {
+    "daily": "Your /daily is ready again! Come and collect it to keep your streak going.",
+    "knock": "Your knock-knock cooldown is over. You can knock on a door again!",
+    "cookie": "You can give another cookie with /award_cookie now.",
+}
+
+def schedule_reminder(guild_id: int, user_id: int, kind: str, seconds: float):
+    """Remember to send a private message when a cooldown ends. Saved in the database, so restarts don't lose it."""
+    db.set_reminder(guild_id, user_id, kind, int(time.time() + seconds))
+
+@tasks.loop(seconds=30)
+async def reminder_loop():
+    guild = client.get_guild(GUILD_ID)
+    if guild is None: return
+    for user_id, kind in db.due_reminders(guild.id, int(time.time())):
+        db.remove_reminder(guild.id, user_id, kind)
+        text = REMINDER_TEXT.get(kind)
+        if text is None or db.get_flag(guild.id, user_id, "reminders_off"): continue
+        if kind == "knock" and not tot_is_active(): continue
+        member = guild.get_member(user_id)
+        if member is None: continue
+        try:
+            await member.send(embed=discord.Embed(title="Cooldown is over", description=text, colour=PINK))
+        except (discord.Forbidden, discord.HTTPException):
+            pass   # their DMs are closed
+
+@reminder_loop.before_loop
+async def before_reminder_loop():
+    await client.wait_until_ready()
+
 @tasks.loop(seconds=30)
 async def mute_checker():
     guild = client.get_guild(GUILD_ID)
@@ -2022,6 +2083,7 @@ async def award_cookie(interaction: discord.Interaction, user: discord.Member):
 
     amount = 2 if "pumpkin_cookie" in db.get_treats(guild_id, giver.id) else 1
     db.give_cookie(guild_id, giver.id, user.id, now, amount)
+    schedule_reminder(guild_id, giver.id, "cookie", cooldown)
     if amount == 1:
         text = f"🍪 {giver.mention} gave a delicious cookie to {user.mention}! So sweet :3"
     else:
@@ -2128,6 +2190,7 @@ async def daily(interaction: discord.Interaction):
     db.add_currency(guild_id, member.id, mups, vups)
     db.set_flag(guild_id, member.id, "daily_last", now)
     db.set_flag(guild_id, member.id, "daily_streak", new_streak)
+    schedule_reminder(guild_id, member.id, "daily", cooldown)
     if whole_xp:
         await give_xp(member, whole_xp)
 
@@ -2167,6 +2230,7 @@ async def revive_streak(interaction: discord.Interaction):
     db.set_flag(guild_id, member.id, "revive_month", month_key(now))
     # Pretend the last claim was one cooldown ago: /daily is ready and the streak continues
     db.set_flag(guild_id, member.id, "daily_last", now - cooldown)
+    schedule_reminder(guild_id, member.id, "daily", 0)   # /daily is ready right now
     await interaction.response.send_message(embed=discord.Embed(
         title="Streak revived!",
         description=f"Your streak of **{streak}** is back. Use **/daily** to keep it going.",
@@ -2328,6 +2392,7 @@ async def knock_knock(interaction: discord.Interaction, user: discord.Member):
     knock_last[knocker.id] = now
     knock_pair_last[(knocker.id, user.id)] = now
     pending_knocks.add(user.id)
+    schedule_reminder(guild_id, knocker.id, "knock", KNOCK_COOLDOWN)
 
     view = KnockView(knocker, user)
     embed = discord.Embed(
@@ -2541,6 +2606,15 @@ async def tot_end(interaction: discord.Interaction):
 # ======================================================================
 #  Moderation: mute
 # ======================================================================
+@client.tree.command(name="reminders", description="Turn private cooldown reminders on or off")
+@app_commands.describe(enabled="True: the bot sends you a private message when a cooldown ends. False: no messages.")
+@app_commands.guild_only()
+async def reminders(interaction: discord.Interaction, enabled: bool):
+    db.set_flag(interaction.guild.id, interaction.user.id, "reminders_off", 0 if enabled else 1)
+    text = ("Reminders are on. I will send you a private message when /daily, /knock-knock or /award_cookie is ready again."
+            if enabled else "Reminders are off. I won't message you about cooldowns.")
+    await interaction.response.send_message(embed=discord.Embed(description=text, colour=CREAM), ephemeral=True)
+
 @client.tree.command(name="mute", description="Mute someone: removes their roles and gives Muted (mods only)")
 @app_commands.describe(user="Who to mute", duration="10d = 10 days, 10h = 10 hours, 10m = 10 minutes", reason="Why they are muted")
 @app_commands.default_permissions(moderate_members=True)

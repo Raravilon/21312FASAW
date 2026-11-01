@@ -2547,20 +2547,29 @@ async def cookie_cmd(interaction: discord.Interaction, member: discord.Member):
 async def bag_cmd(interaction: discord.Interaction, member: discord.Member | None = None):
     if not tot_is_active() and member is None:
         return await interaction.response.send_message("The Trick-or-Treat event is not active right now!", ephemeral=True)
+    
     target = member or interaction.user
     treats = db.get_treats(interaction.guild.id, target.id)
 
+    # Заранее определяем чья это сумка, чтобы не использовать сложные выражения с кавычками внутри f-строки
+    if target == interaction.user:
+        name_prefix = "Your"
+    else:
+        name_prefix = f"{target.display_name}'s"
+
     if not treats:
-        return await interaction.response.send_message(f"{'Your' if target == interaction.user else target.display_name + \"'s\"} bag is empty! 🎃", ephemeral=True)
+        return await interaction.response.send_message(f"{name_prefix} bag is empty! 🎃", ephemeral=True)
 
     lines = [f"• **{treat_name(k)}** x{v}" for k, v in sorted(treats.items())]
     missing = len(TREAT_KEYS) - len(treats)
+    
     embed = discord.Embed(
-        title=f"{'Your' if target == interaction.user else target.display_name + chr(39) + 's'} Treat Bag 🎃",
+        title=f"{name_prefix} Treat Bag 🎃",
         description="\n".join(lines),
         colour=discord.Colour.orange(),
     )
     embed.set_footer(text=f"{len(treats)}/{len(TREAT_KEYS)} unique treats • {missing} still to find!")
+    
     await interaction.response.send_message(embed=embed, ephemeral=(target == interaction.user))
 
 

@@ -1,4 +1,3 @@
-import asyncio
 import os
 import random
 import re
@@ -24,9 +23,12 @@ VERIFY_CHANNEL_ID = int(os.getenv("VERIFY_CHANNEL_ID", "1564405761105461379"))
 # Optional: channel for bot warnings to moderators (0 = look for a channel
 # named "mod-log" or "moderator-only")
 MOD_LOG_CHANNEL_ID = int(os.getenv("MOD_LOG_CHANNEL_ID", "0"))
-# Event channels: 0 = look for a channel whose name contains "general" / "treat-pot"
-GENERAL_CHANNEL_ID = int(os.getenv("1564791988010881034", "0"))
-TREAT_POT_CHANNEL_ID = int(os.getenv("1566554951172366416", "0"))
+# Art channel: every picture posted here gets a heart from the bot, and hearts from
+# other people are counted as "art likes" in the artist's /profile.
+# A moderator/admin reacting with the cross emoji removes all reactions (and likes) from a message.
+ART_CHANNEL_ID = int(os.getenv("ART_CHANNEL_ID", "1564792076900507790"))
+ART_LIKE_EMOJIS = ("\u2764\ufe0f", "\u2764")      # the red heart (with and without the variation selector)
+ART_REMOVE_EMOJI = "\u274c"                         # the cross mark
 
 JOINED_ROLE_NAME = os.getenv("JOINED_ROLE_NAME", "Just joined!")
 NEWCOMER_ROLE_NAME = os.getenv("NEWCOMER_ROLE_NAME", "Newcomer :3")
@@ -49,32 +51,20 @@ LEVEL_ROLES = [
 ]
 
 # ----------------------------------------------------------------------
-#  XP system
+#  XP system: EVERY message gives XP
 # ----------------------------------------------------------------------
 XP_MIN = 20
 XP_MAX = 35
-XP_COOLDOWN_RANGE = (10, 25)    # random seconds between two XP gains (hidden from players)
 
-# Fatigue: the more XP gains in the last hour, the less each one is worth.
-# (gains in the last hour below this number, multiplier). No hard wall.
-FATIGUE_STEPS = [(50, 1.0), (80, 0.7), (110, 0.4), (10**9, 0.15)]
+# Flood protection: the ONLY thing that can stop XP.
+# Very fast + very long messages = no XP for 2 hours.
+FLOOD_WORDS = 40                 # a message with this many words (or more) counts as "huge"
+FLOOD_MESSAGES = 5               # this many huge messages in a row ...
+FLOOD_WINDOW = 120               # ... within this many seconds = flooding
+FLOOD_PAUSE_SECONDS = 2 * 3600   # no XP for 2 hours
 
-# Message quality (by number of different words)
-SINGLE_WORD_MULT = 0.5          # 1 word
-SHORT_MULT = 0.8                # 2-3 words
-LONG_MULT = 1.2                 # 10+ words
-
-# Someone else must be talking too, otherwise XP is reduced
-COMPANY_WINDOW = 15 * 60        # "someone else wrote here in the last 15 minutes"
-SOLO_MULTIPLIER = 0.6
-REPLY_BONUS = 1.15              # replying to another person
-
-# Mechanical-looking timing detector (scripts / macros)
-MECH_MESSAGES = 8               # look at the last 8 messages
-MECH_TOLERANCE = 1.5            # all gaps within 1.5 s of each other ...
-MECH_MIN_GAP = 3.0              # ... and every gap at least 3 s = suspicious
-SUSPICIOUS_SECONDS = 30 * 60    # reduced XP for this long
-SUSPICIOUS_MULTIPLIER = 0.2
+# Cobweb Cotton Candy triggers after this many XP messages in the last hour
+COBWEB_GAINS = 50
 
 # Voice also gives a little XP (only with 2+ people who can hear). 0 = no voice XP.
 VOICE_XP_PER_MINUTE = 5
@@ -84,11 +74,7 @@ VOICE_XP_PER_MINUTE = 5
 # XP_CHANNELS = ["general", "meme-stuff"]. An empty list means XP in every channel.
 XP_CHANNELS = []
 
-# XP boosts (global 2x event and personal Trick or Treat buffs) do NOT stack:
-# only the strongest one counts. Set to True to multiply them instead (x3 * 2 = x6).
-XP_BOOSTS_STACK = False
-
-# ANTI-SPAM (Soft):
+# Mups are only given for "real" messages (letters, not a repeat of a recent message)
 MIN_LETTERS = 2
 MIN_UNIQUE_LETTERS = 2
 SPAM_HISTORY = 5
@@ -153,8 +139,8 @@ intents.message_content = True
 # /daily
 DAILY_COOLDOWN = 24 * 3600
 DAILY_COOLDOWN_TRUFFLE = 19 * 3600     # Witch Hat Truffle
-DAILY_WINDOW = 26 * 3600               # the streak survives this long after the last claim
-DAILY_WINDOW_COCOA = 30 * 3600         # Cauldron Cocoa
+DAILY_WINDOW = 36 * 3600               # the streak survives this long after the last claim (24h cooldown + 12h)
+DAILY_WINDOW_COCOA = 40 * 3600         # Cauldron Cocoa (+4h)
 DAILY_BASE_MUPS = 0.5
 DAILY_BASE_VUPS = 0.1
 DAILY_MUPS_STEP = 0.01                 # per streak day
@@ -306,6 +292,17 @@ class Database:
                 user_id INTEGER NOT NULL,
                 role_name TEXT NOT NULL,
                 PRIMARY KEY (guild_id, user_id, role_name)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS art_likes (
+                guild_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                author_id INTEGER NOT NULL,
+                liker_id INTEGER NOT NULL,
+                PRIMARY KEY (message_id, liker_id)
             )
             """
         )
@@ -731,6 +728,30 @@ class Database:
         ).fetchall()
         return {row[0] for row in rows}
 
+    # ----- art likes -----
+    def add_art_like(self, guild_id: int, message_id: int, author_id: int, liker_id: int) -> bool:
+        """True if the like is new, False if this person already liked this art."""
+        cursor = self.conn.execute(
+            "INSERT OR IGNORE INTO art_likes (guild_id, message_id, author_id, liker_id) VALUES (?, ?, ?, ?)",
+            (guild_id, message_id, author_id, liker_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def get_art_likes(self, guild_id: int, user_id: int) -> int:
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM art_likes WHERE guild_id = ? AND author_id = ?",
+            (guild_id, user_id),
+        ).fetchone()[0]
+
+    def remove_art_like(self, message_id: int, liker_id: int):
+        self.conn.execute("DELETE FROM art_likes WHERE message_id = ? AND liker_id = ?", (message_id, liker_id))
+        self.conn.commit()
+
+    def clear_art_likes(self, message_id: int):
+        self.conn.execute("DELETE FROM art_likes WHERE message_id = ?", (message_id,))
+        self.conn.commit()
+
 db = Database(DB_PATH)
 
 # ======================================================================
@@ -880,8 +901,6 @@ async def mod_log(guild: discord.Guild, title: str, description: str):
 # ======================================================================
 #  Shop Data (Packs) - ALL 50% OFF
 # ======================================================================
-HALLOWEEN_EXPIRY = 1793750400   # 2026-11-04 00:00 UTC = the end of November 3
-
 SHOP_CATEGORIES = {
     "expie": {
         "label": "Expie Pack",
@@ -898,14 +917,6 @@ SHOP_CATEGORIES = {
         "items": [
             {"key": "cool_femboy", "name": "Cool femboy", "emoji": "Da_cool_femboy", "role": "Cool femboy", "description": "Da cool femboy!", "mups": 30, "vups": 0},
             {"key": "maplet", "name": "Maplet", "emoji": "Silly_Critter", "role": "Maplet", "description": "Little Maplefuw", "mups": 5, "vups": 0},
-        ],
-    },
-    "halloween": {
-        "label": "Halloween Pack",
-        "flag": "LIMITED",
-        "expiry": HALLOWEEN_EXPIRY,
-        "items": [
-            {"key": "halloween_pumpkin_cat", "name": "Halloween Pumpkin Cat", "emoji": "halloween_pupkin_cat", "role": "Halloween Pumpkin", "description": "Spooky month, silly critters!", "mups": 22, "vups": 2},
         ],
     },
     "silly": {
@@ -944,6 +955,7 @@ def get_active_shop_categories():
         if "expiry" in data and now > data["expiry"]: continue
         active[key] = data
     return active
+
 
 # ======================================================================
 #  Self-assign roles & Profile Edit
@@ -1004,7 +1016,6 @@ class RolesPanelView(discord.ui.View):
                 if role: group[label] = role
             if not any(group.values()): continue
             self.add_item(RoleGroupSelect(member, group, placeholder, multiple, row))
-        add_event_role_select(self, member, 3)
 
 class EmojiSelect(discord.ui.Select):
     def __init__(self, member: discord.Member, guild: discord.Guild):
@@ -1104,7 +1115,6 @@ class EditProfilePanel(discord.ui.View):
 
         self.add_item(EmojiSelect(member, guild))
         self.add_item(EditNameButton())
-        add_event_role_select(self, member, 4)
 
 class ProfileView(discord.ui.View):
     def __init__(self, member: discord.Member):
@@ -1319,14 +1329,12 @@ class SillyBot(discord.Client):
         self.add_view(CreateVoiceView())
         self.add_view(GetRolesView())
         self.add_view(InventoryView())
-        self.add_view(MysteryBoxView())
-        self.add_view(TreatPotView())
+        self.add_view(ApplicationsView())
         voice_tracker.start()
         voice_cleanup.start()
         mute_checker.start()
         reminder_loop.start()
         treat_weekly.start()
-        mystery_box_loop.start()
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
@@ -1337,18 +1345,15 @@ class SillyBot(discord.Client):
 client = SillyBot()
 
 # ======================================================================
-#  XP engine
+#  XP engine: every message gives XP, only flooding stops it
 # ======================================================================
-next_xp_time: dict[tuple[int, int], float] = {}                  # earliest time of the next XP gain
-recent_messages: dict[tuple[int, int], deque] = {}               # for the "similar message" filter
-xp_timestamps: dict[tuple[int, int], deque] = {}                 # XP gains in the last hour (fatigue)
-channel_activity: dict[int, deque] = {}                          # channel -> (time, author) of recent messages
-message_times: dict[tuple[int, int], deque] = {}                 # last message times (mechanical detector)
-suspicious_until: dict[tuple[int, int], float] = {}              # reduced XP until this time
+recent_messages: dict[tuple[int, int], deque] = {}               # for the "similar message" filter (Mups only)
+xp_timestamps: dict[tuple[int, int], deque] = {}                 # XP gains in the last hour
+flood_times: dict[tuple[int, int], deque] = {}                   # times of the latest huge messages
+xp_paused_until: dict[tuple[int, int], float] = {}               # no XP until this time (flooding)
 
 URL_RE = re.compile(r"https?://\S+")
 DISCORD_TAG_RE = re.compile(r"<a?:\w+:\d+>|<[@#][!&]?\d+>")
-WORD_RE = re.compile(r"[^\W\d_]+")
 
 # --- xp engine helpers (pure functions) ---
 def letters_only(text: str) -> str:
@@ -1357,6 +1362,7 @@ def letters_only(text: str) -> str:
     return re.sub(r"[\W\d_]+", "", text).lower()
 
 def is_real_message(key: tuple[int, int], content: str) -> bool:
+    """Used only for Mups: real letters and not a copy of a recent message."""
     letters = letters_only(content)
     if len(letters) < MIN_LETTERS or len(set(letters)) < MIN_UNIQUE_LETTERS: return False
     history = recent_messages.setdefault(key, deque(maxlen=SPAM_HISTORY))
@@ -1365,38 +1371,19 @@ def is_real_message(key: tuple[int, int], content: str) -> bool:
     history.append(letters)
     return True
 
-def unique_word_count(text: str) -> int:
+def word_count(text: str) -> int:
     text = URL_RE.sub(" ", text)
     text = DISCORD_TAG_RE.sub(" ", text)
-    return len(set(WORD_RE.findall(text.lower())))
+    return len(text.split())
 
-def quality_multiplier(unique_words: int) -> float:
-    """C: more different words = more XP. Repeating one word gives very little."""
-    if unique_words <= 1: return SINGLE_WORD_MULT
-    if unique_words <= 3: return SHORT_MULT
-    if unique_words <= 9: return 1.0
-    return LONG_MULT
-
-def fatigue_multiplier(gains_last_hour: int) -> float:
-    """B: smooth slowdown instead of a hard wall."""
-    for limit, mult in FATIGUE_STEPS:
-        if gains_last_hour < limit: return mult
-    return FATIGUE_STEPS[-1][1]
-
-def has_company(channel_id: int, author_id: int, now: float) -> bool:
-    """D: did someone else write in this channel recently?"""
-    recent = channel_activity.get(channel_id)
-    if not recent: return False
-    return any(author != author_id and now - when <= COMPANY_WINDOW for when, author in recent)
-
-def looks_mechanical(key: tuple[int, int], now: float) -> bool:
-    """E: messages arriving at suspiciously even intervals (scripts, macros)."""
-    times = message_times.setdefault(key, deque(maxlen=MECH_MESSAGES))
+def is_flooding(key: tuple[int, int], content: str, now: float) -> bool:
+    """Many huge messages (FLOOD_WORDS+ words) in a row, very fast."""
+    times = flood_times.setdefault(key, deque(maxlen=FLOOD_MESSAGES))
+    if word_count(content) < FLOOD_WORDS:
+        times.clear()          # a normal message breaks the streak
+        return False
     times.append(now)
-    if len(times) < MECH_MESSAGES: return False
-    ordered = list(times)
-    gaps = [b - a for a, b in zip(ordered, ordered[1:])]
-    return min(gaps) >= MECH_MIN_GAP and (max(gaps) - min(gaps)) <= MECH_TOLERANCE
+    return len(times) >= FLOOD_MESSAGES and now - times[0] <= FLOOD_WINDOW
 
 def channel_gives_xp(channel) -> bool:
     """XP only in the channels listed in XP_CHANNELS (text channels and their threads)."""
@@ -1406,15 +1393,6 @@ def channel_gives_xp(channel) -> bool:
     name = base.name.lower()
     return any(word.lower() in name for word in XP_CHANNELS)
 
-def combine_xp_multipliers(global_mult: float, personal_mult: float) -> float:
-    """Global event and personal buff: the strongest boost wins, they don't multiply.
-    A curse (below 1.0) still applies when there is no boost."""
-    if XP_BOOSTS_STACK:
-        return global_mult * personal_mult
-    boosts = [m for m in (global_mult, personal_mult) if m > 1.0]
-    if boosts:
-        return max(boosts)
-    return min(global_mult, personal_mult)
 # --- end xp engine helpers ---
 
 
@@ -1461,7 +1439,7 @@ TREAT_INFO = {
     "gloomy_gumdrop": "When you spend Mups or Vups, 10% chance to get half of them back.",
     "skeleton_biscuit": "Takes 2 Mups and 1 Vups every week. With more than 100 Mups, 10% chance to give you 10 Mups.",
     "cobweb_cotton_candy": "Talk too much and you get muted for 60 seconds, then +5% XP for an hour. (5h cooldown)",
-    "cauldron_cocoa": "Your daily streak lasts longer: 26h becomes 30h.",
+    "cauldron_cocoa": "Your daily streak lasts longer: 36h becomes 40h.",
     "mummy_muffin": "Voice chats give you 10% more XP and voice time.",
     "sugar_skull": "Your sent message can crumble away with 10% chance. (5h cooldown)",
     "toffee_toad": "If your daily streak breaks, revive it once a month with /revive_streak.",
@@ -1470,51 +1448,8 @@ TREAT_INFO = {
     "chocolate_pawprint": "When you pat someone, they get 1 XP.",
 }
 
-LOVELY_HORNET_ROLE = "Lovely Hornet ^^"   # end of the event: most karma
-HORNET_HALLOW_ROLE = "Hornet Hallow"      # collected all 20 treats
-LMAO_HORNET_ROLE = "Lmao Hornet"          # 1% on Treat, can drop only once ever
-GHOSTLY_ROLE = "Ghostly"                  # 1% on a successful Trick, for the scared person
-EVENT_NAME_EMOJIS = [
-    {"name": "Lovely Hornet", "role": LOVELY_HORNET_ROLE},
-    {"name": "Hornet Hallow", "role": HORNET_HALLOW_ROLE},
-    {"name": "Lmao Hornet", "role": LMAO_HORNET_ROLE},
-    {"name": "Ghostly", "role": GHOSTLY_ROLE},
-    {"name": "Witch", "role": "Witch"},
-]
-
-TRICK_SUCCESS_CHANCE = 0.5      # a Trick works 50% of the time
-GHOST_MARSHMALLOW_REDUCTION = 0.05
-TRICK_XP_PERCENT = 20           # a Trick can steal this % of the XP progress inside the current level
-TRICK_CURRENCY_RANGE = (10, 20)
-TREAT_REPEAT_CHANCE = 0.70      # a Treat is a repeat (the receiver already owns it) 70% of the time, when the giver has one
-LMAO_CHANCE = 0.01
-GHOST_CHANCE = 0.01
-TREAT_END_REWARD_MUPS = 5       # Mups per collected treat when the event ends
-
-KARMA_TREAT = 2                 # you gave a treat
-KARMA_TRICK_FAIL = -1           # your Trick failed
-
-KNOCK_TIMEOUT = 90              # seconds to answer the door
-KNOCK_COOLDOWN = 180            # seconds between two knocks by the same person (3 minutes)
-TRICK_COOLDOWN = 300            # seconds between two Tricks by the same person (5 minutes)
-KNOCK_PAIR_COOLDOWN = 3600      # the same person can't knock on the same door again for this long
-
-pending_knocks: set[int] = set()
-knock_last: dict[int, float] = {}
-knock_pair_last: dict[tuple[int, int], float] = {}
-trick_last: dict[int, float] = {}
-
 def treat_name(key: str) -> str:
     return TREAT_NAMES.get(key, key)
-
-def tot_is_active() -> bool:
-    return db.get_setting("tot_active", "0") == "1"
-
-def ensure_treat_starter(guild_id: int, user_id: int):
-    """Late joiners and quiet members get their starting treat the first time they take part."""
-    if not tot_is_active() or db.tot_has_starter(guild_id, user_id):
-        return
-    db.tot_give_starter(guild_id, user_id, random.choice(TREAT_KEYS))
 
 def is_night() -> bool:
     hour = (datetime.datetime.now(datetime.timezone.utc).hour + NIGHT_UTC_OFFSET) % 24
@@ -1538,108 +1473,6 @@ def gumdrop_refund(guild_id: int, user_id: int, mups: float, vups: float) -> str
     if back_m: parts.append(f"{fmt_num(back_m)} Mups")
     if back_v: parts.append(f"{fmt_num(back_v)} Vups")
     return f"Your Gloomy Gumdrop gave back {' and '.join(parts)}!"
-
-# --- game rules (no Discord needed) ---
-def resolve_treat(guild_id: int, knocker_id: int, target_id: int) -> dict:
-    """The target (giver) gives the knocker a copy of one of the GIVER's OWN treats.
-    70% of the time it is one the knocker already owns (a repeat), if the giver has such a treat."""
-    mine = db.get_treats(guild_id, target_id)
-    if not mine:
-        return {"treat": None, "is_new": False, "count": 0, "lmao": False}
-    theirs = db.get_treats(guild_id, knocker_id)
-    repeat_pool = [key for key in mine if key in theirs]
-    new_pool = [key for key in mine if key not in theirs]
-    repeat_chance = TREAT_REPEAT_CHANCE
-    if time.time() < db.get_flag(guild_id, knocker_id, "luck_end"):
-        repeat_chance = 1 - 0.60   # Treat luck!: new treat 30% -> 60%
-    if repeat_pool and (not new_pool or random.random() < repeat_chance):
-        key = random.choice(repeat_pool)
-    else:
-        key = random.choice(new_pool)
-    is_new = db.add_treat(guild_id, knocker_id, key)
-    count = db.get_treats(guild_id, knocker_id).get(key, 1)
-    db.add_karma(guild_id, target_id, KARMA_TREAT)
-    lmao = db.get_setting("lmao_hornet_given", "0") != "1" and random.random() < LMAO_CHANCE
-    return {"treat": key, "is_new": is_new, "count": count, "lmao": lmao}
-
-def resolve_trick(guild_id: int, knocker_id: int, target_id: int, roll: float) -> dict:
-    """The target (thief) tricks the knocker (victim). `roll` is a random number from 0 to 1."""
-    shield = int(db.get_flag(guild_id, knocker_id, "shield_n"))
-    if shield > 0:   # Ghost Shield: the trick fails and uses up one charge
-        db.set_flag(guild_id, knocker_id, "shield_n", shield - 1)
-        db.add_karma(guild_id, target_id, KARMA_TRICK_FAIL)
-        return {"success": False, "karma": KARMA_TRICK_FAIL, "shield": True}
-    chance = TRICK_SUCCESS_CHANCE
-    if time.time() < db.get_flag(guild_id, target_id, "brew_end"):
-        chance = 0.80   # Thief's Brew
-    if "ghost_marshmallow" in db.get_treats(guild_id, knocker_id):
-        chance -= GHOST_MARSHMALLOW_REDUCTION
-    if roll >= chance:
-        db.add_karma(guild_id, target_id, KARMA_TRICK_FAIL)
-        return {"success": False, "karma": KARMA_TRICK_FAIL}
-
-    result = {"success": True, "kind": None, "amount": 0, "currency": None, "treat": None, "karma": 0, "ghost": False}
-
-    # steal one copy of a random treat from the victim
-    victim_treats = db.get_treats(guild_id, knocker_id)
-    thief_treats = db.get_treats(guild_id, target_id)
-    stealable = [key for key in victim_treats if key not in thief_treats]   # only treats the thief doesn't have
-    if stealable:
-        treat = random.choice(stealable)
-        db.remove_treat(guild_id, knocker_id, treat)
-        db.add_treat(guild_id, target_id, treat)
-        result["treat"] = treat
-
-    loss = 0
-    if random.random() < 0.5:
-        data = db.get(guild_id, knocker_id)
-        _, into_level, _ = level_from_xp(data["xp"])
-        stolen = int(into_level * TRICK_XP_PERCENT / 100)
-        result["kind"] = "xp"
-        result["amount"] = stolen
-        if stolen:
-            db.add_xp(guild_id, knocker_id, -stolen)
-            db.add_xp(guild_id, target_id, stolen)
-            loss = min(10, 1 + stolen // 25)
-    else:
-        column = random.choice(["mups", "vups"])
-        wanted = random.randint(*TRICK_CURRENCY_RANGE)
-        taken = db.steal_currency(guild_id, knocker_id, target_id, wanted, column)
-        result["kind"] = "currency"
-        result["amount"] = taken
-        result["currency"] = column.capitalize()
-        if taken:
-            loss = 1 + int(taken) // 5
-
-    if result["treat"]: loss += 1
-    if loss == 0: loss = 1
-    result["karma"] = -loss
-    db.add_karma(guild_id, target_id, -loss)
-    result["ghost"] = random.random() < GHOST_CHANCE
-    return result
-
-async def check_hornet_hallow(guild: discord.Guild, member: discord.Member) -> bool:
-    """Collecting every treat gives the limited Hornet Hallow role. True if it was just given."""
-    if len(db.get_treats(guild.id, member.id)) < len(TREAT_KEYS):
-        return False
-    role = await get_role(guild, HORNET_HALLOW_ROLE)
-    if role is None or role in member.roles:
-        return False
-    try:
-        await member.add_roles(role, reason="Collected every treat")
-    except (discord.Forbidden, discord.HTTPException):
-        return False
-    return True
-
-async def grant_role_by_name(member: discord.Member, role_name: str, reason: str) -> bool:
-    role = await get_role(member.guild, role_name)
-    if role is None or role in member.roles:
-        return False
-    try:
-        await member.add_roles(role, reason=reason)
-    except (discord.Forbidden, discord.HTTPException):
-        return False
-    return True
 
 
 # ======================================================================
@@ -1713,7 +1546,7 @@ async def voice_tracker():
     for channel in guild.voice_channels + guild.stage_channels:
         if channel == guild.afk_channel: continue
         humans = [m for m in channel.members if not m.bot]
-        # G: only count people who can actually hear, and need at least 2 of them
+        # only count people who can actually hear, and need at least 2 of them
         listeners = [
             m for m in humans
             if m.voice is not None and m.voice.channel == channel and not (m.voice.deaf or m.voice.self_deaf)
@@ -1769,7 +1602,6 @@ async def before_voice_cleanup():
 
 REMINDER_TEXT = {
     "daily": "Your /daily is ready again! Come and collect it to keep your streak going.",
-    "knock": "Your knock-knock cooldown is over. You can knock on a door again!",
     "cookie": "You can give another cookie with /award_cookie now.",
 }
 
@@ -1785,7 +1617,6 @@ async def reminder_loop():
         db.remove_reminder(guild.id, user_id, kind)
         text = REMINDER_TEXT.get(kind)
         if text is None or db.get_flag(guild.id, user_id, "reminders_off"): continue
-        if kind == "knock" and not tot_is_active(): continue
         member = guild.get_member(user_id)
         if member is None: continue
         try:
@@ -1892,36 +1723,32 @@ async def on_message(message: discord.Message):
     now = int(now_f)
     treats = db.get_treats(gid, member.id)
 
-    # --- context about this message ---
-    company = has_company(message.channel.id, member.id, now_f)
+    # --- art channel: the bot puts the first heart under every picture ---
+    if message.channel.id == ART_CHANNEL_ID and message_has_art(message):
+        try: await message.add_reaction(ART_LIKE_EMOJIS[0])
+        except (discord.Forbidden, discord.HTTPException): pass
 
-    replied_to_human = False
-    reference = message.reference
-    if reference is not None and isinstance(reference.resolved, discord.Message):
-        original_author = reference.resolved.author
-        if original_author.id != member.id and not original_author.bot:
-            replied_to_human = True
-            company = True   # answering someone counts as talking together
-
-    # E: scripts and macros send messages at very even intervals
-    if looks_mechanical(key, now_f) and now_f >= suspicious_until.get(key, 0):
-        suspicious_until[key] = now_f + SUSPICIOUS_SECONDS
+    # --- flood protection: very fast + very long messages = no XP for 2 hours ---
+    paused = now_f < xp_paused_until.get(key, 0)
+    if not paused and is_flooding(key, message.content, now_f):
+        xp_paused_until[key] = now_f + FLOOD_PAUSE_SECONDS
+        flood_times[key].clear()
+        paused = True
         await mod_log(
             message.guild,
-            "Suspicious message timing",
-            f"{member.mention} in {message.channel.mention} sends messages at very even intervals. "
-            f"Their XP is reduced for {SUSPICIOUS_SECONDS // 60} minutes.",
+            "XP paused for flooding",
+            f"{member.mention} in {message.channel.mention} sent {FLOOD_MESSAGES} huge messages "
+            f"({FLOOD_WORDS}+ words) very fast. No XP for {FLOOD_PAUSE_SECONDS // 3600} hours.",
         )
 
-    channel_activity.setdefault(message.channel.id, deque(maxlen=30)).append((now_f, member.id))
-
+    # used only for Mups (real letters, not a repeat)
     counted = is_real_message(key, message.content)
 
-    # --- XP ---
+    # --- XP: every message gives XP ---
     gain = 0
     count_for_mups = False
     cobweb_triggered = False
-    if counted and channel_gives_xp(message.channel) and now_f >= next_xp_time.get(key, 0):
+    if not paused and channel_gives_xp(message.channel):
         history = xp_timestamps.setdefault(key, deque())
         while history and now - history[0] > 3600:
             history.popleft()
@@ -1930,23 +1757,13 @@ async def on_message(message: discord.Message):
         data = db.get(gid, member.id)
         current_level = level_from_xp(data["xp"])[0]
 
-        quality = quality_multiplier(unique_word_count(message.content))
-        fatigue = fatigue_multiplier(gains_last_hour)
-        company_mult = 1.0 if company else SOLO_MULTIPLIER
-        suspicious_mult = SUSPICIOUS_MULTIPLIER if now_f < suspicious_until.get(key, 0) else 1.0
-        reply_mult = REPLY_BONUS if replied_to_human else 1.0
-
         base_gain = random.randint(XP_MIN, XP_MAX)
         level_bonus = int(current_level * 0.5)
         if "goober_jelly" in treats:
             level_bonus += data["messages"] * 0.001
 
-        # Global / TrickOrTreat Multipliers
-        global_xp = float(db.get_setting("global_xp_mult", "1.0"))
-        tot_xp_buff = 1.0
-        if now < data.get("xp_buff_end", 0):
-            tot_xp_buff = data.get("xp_buff_value", 1.0)
-        event_mult = combine_xp_multipliers(global_xp, tot_xp_buff)
+        # Global 2x XP (/event_2x_xp)
+        event_mult = float(db.get_setting("global_xp_mult", "1.0"))
 
         # Treat buffs
         treat_xp = 1.0
@@ -1954,10 +1771,8 @@ async def on_message(message: discord.Message):
         if "moon_caramel" in treats and is_night(): treat_xp *= 1.05
         if "cursed_candy_corn" in treats: treat_xp *= 0.98
         if now_f < db.get_flag(gid, member.id, "cobweb_boost_end"): treat_xp *= 1.05
-        if now_f < db.get_flag(gid, member.id, "strange_xp_end"):
-            treat_xp *= db.get_flag(gid, member.id, "strange_xp_mult", 1.0) or 1.0
 
-        gain = int((base_gain + level_bonus) * quality * fatigue * company_mult * suspicious_mult * reply_mult * event_mult * treat_xp)
+        gain = int((base_gain + level_bonus) * event_mult * treat_xp)
         gain = max(1, gain)
 
         if "black_bombob" in treats:
@@ -1967,17 +1782,13 @@ async def on_message(message: discord.Message):
                 gain = gain * 2 if random.random() < 0.5 else max(1, gain // 2)
             db.set_flag(gid, member.id, "bombob_n", counter)
 
-        # Mups only for real conversation, and only for the first gains of each hour
-        count_for_mups = (
-            quality >= SHORT_MULT and company and suspicious_mult == 1.0
-            and gains_last_hour < MUPS_ELIGIBLE_PER_HOUR
-        )
+        # Mups: only for real messages, and only the first gains of each hour
+        count_for_mups = counted and gains_last_hour < MUPS_ELIGIBLE_PER_HOUR
 
-        next_xp_time[key] = now_f + random.uniform(*XP_COOLDOWN_RANGE)
         history.append(now)
 
-        # Cobweb Cotton Candy: talking a lot (a full hour of normal XP gains) mutes you for a minute
-        if ("cobweb_cotton_candy" in treats and len(history) >= FATIGUE_STEPS[0][0]
+        # Cobweb Cotton Candy: talking a lot mutes you for a minute
+        if ("cobweb_cotton_candy" in treats and len(history) >= COBWEB_GAINS
                 and now_f >= db.get_flag(gid, member.id, "cobweb_cd")):
             db.set_flag(gid, member.id, "cobweb_cd", now_f + 5 * 3600)
             db.set_flag(gid, member.id, "cobweb_boost_end", now_f + 60 + 3600)
@@ -2054,7 +1865,7 @@ async def profile(interaction: discord.Interaction, member: discord.Member | Non
     data = db.get(interaction.guild.id, target_member.id)
     level, into_level, needed = level_from_xp(data["xp"])
     rank = db.rank(interaction.guild.id, data["xp"])
-    karma = db.get_karma(interaction.guild.id, target_member.id)
+    art_likes = db.get_art_likes(interaction.guild.id, target_member.id)
 
     next_reward = "All roles unlocked"
     for required_level, role_name in LEVEL_ROLES:
@@ -2078,7 +1889,7 @@ async def profile(interaction: discord.Interaction, member: discord.Member | Non
     embed.add_field(name="Pings sent", value=f"{data['pings']:,}", inline=True)
     embed.add_field(name="Time in voice", value=format_duration(data["voice_seconds"]), inline=True)
 
-    embed.add_field(name="Karma", value=f"{karma:,}", inline=True)
+    embed.add_field(name="Art likes", value=f"❤️ {art_likes:,}", inline=True)
     embed.add_field(name="Next reward", value=next_reward, inline=True)
     embed.set_footer(text="Keep chatting and be silly :3")
 
@@ -2250,6 +2061,18 @@ def month_key(now: float) -> int:
     moment = datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
     return moment.year * 100 + moment.month
 
+def revive_limit(treats: dict) -> int:
+    """Everybody can revive a broken streak once a month, Toffee Toad owners twice."""
+    return 2 if "toffee_toad" in treats else 1
+
+def revives_used(guild_id: int, user_id: int, now: float) -> int:
+    if int(db.get_flag(guild_id, user_id, "revive_month")) != month_key(now):
+        return 0
+    return max(1, int(db.get_flag(guild_id, user_id, "revive_count")))   # old saves: a revive was used, count was not stored
+
+def revives_left(guild_id: int, user_id: int, treats: dict, now: float) -> int:
+    return max(0, revive_limit(treats) - revives_used(guild_id, user_id, now))
+
 def daily_timing(treats: dict) -> tuple[int, int]:
     cooldown = DAILY_COOLDOWN_TRUFFLE if "witch_hat_truffle" in treats else DAILY_COOLDOWN
     window = DAILY_WINDOW_COCOA if "cauldron_cocoa" in treats else DAILY_WINDOW
@@ -2275,13 +2098,12 @@ async def daily(interaction: discord.Interaction):
         return
 
     broken = bool(last) and now - last > window
-    can_revive = (broken and streak > 0 and "toffee_toad" in treats
-                  and int(db.get_flag(guild_id, member.id, "revive_month")) != month_key(now))
+    can_revive = broken and streak > 0 and revives_left(guild_id, member.id, treats, now) > 0
     if can_revive and int(db.get_flag(guild_id, member.id, "revive_warned")) != last:
         db.set_flag(guild_id, member.id, "revive_warned", last)
         embed = discord.Embed(
             title="Your streak broke",
-            description=f"Your streak of **{streak}** broke, but your Toffee Toad can bring it back.\n"
+            description=f"Your streak of **{streak}** broke, but you can bring it back.\n"
                         f"Use **/revive_streak** to revive it, or use **/daily** again to start over.",
             colour=CREAM,
         )
@@ -2316,18 +2138,13 @@ async def daily(interaction: discord.Interaction):
     embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
     await interaction.response.send_message(embed=embed)
 
-@client.tree.command(name="revive_streak", description="Bring back a broken daily streak (needs a Toffee Toad, once a month)")
+@client.tree.command(name="revive_streak", description="Bring back a broken daily streak (once a month, twice with a Toffee Toad)")
 @app_commands.guild_only()
 async def revive_streak(interaction: discord.Interaction):
     guild_id = interaction.guild.id
     member = interaction.user
     now = int(time.time())
     treats = db.get_treats(guild_id, member.id)
-
-    if "toffee_toad" not in treats:
-        await interaction.response.send_message(embed=discord.Embed(
-            description="You need a Toffee Toad treat to revive a streak.", colour=CREAM), ephemeral=True)
-        return
 
     cooldown, window = daily_timing(treats)
     last = int(db.get_flag(guild_id, member.id, "daily_last"))
@@ -2336,193 +2153,32 @@ async def revive_streak(interaction: discord.Interaction):
         await interaction.response.send_message(embed=discord.Embed(
             description="Your streak isn't broken, there is nothing to revive.", colour=CREAM), ephemeral=True)
         return
-    if int(db.get_flag(guild_id, member.id, "revive_month")) == month_key(now):
+
+    limit = revive_limit(treats)
+    used = revives_used(guild_id, member.id, now)
+    if used >= limit:
+        extra = "" if "toffee_toad" in treats else " (with a Toffee Toad you get 2 revives a month)"
         await interaction.response.send_message(embed=discord.Embed(
-            description="You already revived a streak this month. Try again next month!", colour=CREAM), ephemeral=True)
+            description=f"You already used your {limit} revive{'s' if limit != 1 else ''} this month{extra}. Try again next month!",
+            colour=CREAM), ephemeral=True)
         return
 
     db.set_flag(guild_id, member.id, "revive_month", month_key(now))
+    db.set_flag(guild_id, member.id, "revive_count", used + 1)
     # Pretend the last claim was one cooldown ago: /daily is ready and the streak continues
     db.set_flag(guild_id, member.id, "daily_last", now - cooldown)
     schedule_reminder(guild_id, member.id, "daily", 0)   # /daily is ready right now
+    left = limit - (used + 1)
     await interaction.response.send_message(embed=discord.Embed(
         title="Streak revived!",
-        description=f"Your streak of **{streak}** is back. Use **/daily** to keep it going.",
+        description=f"Your streak of **{streak}** is back. Use **/daily** to keep it going.\n"
+                    f"Revives left this month: {left}",
         colour=PINK))
 
 
 # ======================================================================
-#  Trick or Treat: knock-knock (members trick or treat each other)
+#  Inventory (treats and what they do)
 # ======================================================================
-class KnockView(discord.ui.View):
-    def __init__(self, knocker: discord.Member, target: discord.Member):
-        super().__init__(timeout=KNOCK_TIMEOUT)
-        self.knocker = knocker
-        self.target = target
-        self.message: discord.Message | None = None
-        self.finished = False
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.target.id: return True
-        await interaction.response.send_message("This door isn't yours to open!", ephemeral=True)
-        return False
-
-    def finish(self):
-        self.finished = True
-        pending_knocks.discard(self.target.id)
-        self.stop()
-
-    async def show_result(self, text: str):
-        embed = discord.Embed(title="Knock knock!", description=text, colour=PINK)
-        try:
-            await self.message.edit(content=None, embed=embed, view=None)
-        except (discord.NotFound, discord.HTTPException, AttributeError):
-            pass
-
-    @discord.ui.button(label="Treat!", style=discord.ButtonStyle.success)
-    async def treat(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.finished:
-            await interaction.response.send_message("Too late, the door is closed.", ephemeral=True)
-            return
-        self.finish()
-        await interaction.response.defer()
-
-        guild = interaction.guild
-        result = resolve_treat(guild.id, self.knocker.id, self.target.id)
-        knocker, target = self.knocker.mention, self.target.mention
-        if result["treat"] is None:
-            await self.show_result(f"{target} chose **Treat**, but has no treats to give yet. The thought counts!")
-            return
-        name = treat_name(result["treat"])
-
-        if result["is_new"]:
-            text = f"{target} chose **Treat** and gave {knocker} a brand new treat: **{name}**! (+{KARMA_TREAT} karma)"
-        else:
-            text = f"{target} chose **Treat** and gave {knocker} another **{name}**! Now they have {result['count']}. (+{KARMA_TREAT} karma)"
-
-        if result["lmao"] and await grant_role_by_name(self.knocker, LMAO_HORNET_ROLE, "Lucky Treat drop"):
-            db.set_setting("lmao_hornet_given", "1")
-            text += f"\nA tiny hornet flew out of the bag... {knocker} got the limited **{LMAO_HORNET_ROLE}** role! Nobody else can get it now."
-        if await check_hornet_hallow(guild, self.knocker):
-            text += f"\n{knocker} collected every treat and became a **{HORNET_HALLOW_ROLE}**!"
-        await self.show_result(text)
-
-    @discord.ui.button(label="Trick!", style=discord.ButtonStyle.danger)
-    async def trick(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.finished:
-            await interaction.response.send_message("Too late, the door is closed.", ephemeral=True)
-            return
-        now = time.time()
-        left = TRICK_COOLDOWN - (now - trick_last.get(self.target.id, 0))
-        if left > 0:
-            await interaction.response.send_message(f"Your tricks need a rest! You can trick again in {int(left // 60)}m {int(left % 60)}s. You can still choose Treat.", ephemeral=True)
-            return
-        trick_last[self.target.id] = now
-        self.finish()
-        await interaction.response.defer()
-
-        guild = interaction.guild
-        result = resolve_trick(guild.id, self.knocker.id, self.target.id, random.random())
-        knocker, target = self.knocker.mention, self.target.mention
-
-        if not result["success"]:
-            if result.get("shield"):
-                await self.show_result(f"{target} chose **Trick**... but a **Ghost Shield** protected {knocker}! The trick failed ~w~ ({KARMA_TRICK_FAIL} karma)")
-            else:
-                await self.show_result(f"{target} chose **Trick**... but {knocker} wasn't scared at all! The trick failed ~w~ ({KARMA_TRICK_FAIL} karma)")
-            return
-
-        treat_text = f"**{treat_name(result['treat'])}**" if result["treat"] else None
-        karma_text = f"({result['karma']} karma)"
-        if result["kind"] == "xp" and result["amount"]:
-            text = f"{target} just stole {TRICK_XP_PERCENT}% of {knocker}'s XP"
-            text += f" and their {treat_text} treat!! How evil!! {karma_text}" if treat_text else "!! How evil!! " + karma_text
-        elif result["kind"] == "currency" and result["amount"]:
-            text = f"{target} stole {fmt_num(result['amount'])} {result['currency']} from {knocker}"
-            text += f" with their {treat_text} treat!! {karma_text}" if treat_text else "!! " + karma_text
-        elif treat_text:
-            text = f"{target} chose **Trick** and scared {knocker}! They only found their {treat_text} treat, and took it! {karma_text}"
-        else:
-            text = f"{target} chose **Trick** and scared {knocker}, but there was nothing to steal! {karma_text}"
-
-        if await check_hornet_hallow(guild, self.target):
-            text += f"\n{target} collected every treat and became a **{HORNET_HALLOW_ROLE}**!"
-        await self.show_result(text)
-
-        # The scared person can rarely turn into a ghost
-        if result["ghost"] and await grant_role_by_name(self.knocker, GHOSTLY_ROLE, "Scared by a cat ghost"):
-            try:
-                await interaction.followup.send(
-                    content=knocker,
-                    embed=discord.Embed(
-                        description=f"WOAHH.. A GHOST!! You were scared by a cat ghost!... You got.. a special role. (/profile)",
-                        colour=CREAM),
-                    allowed_mentions=discord.AllowedMentions(users=[self.knocker]),
-                )
-            except discord.HTTPException:
-                pass
-
-    async def on_timeout(self):
-        if self.finished: return
-        self.finish()
-        try:
-            await self.message.edit(content=None, embed=discord.Embed(
-                title="Knock knock!",
-                description=f"Nobody opened the door... {self.target.mention} didn't answer {self.knocker.mention}.",
-                colour=PINK), view=None)
-        except (discord.NotFound, discord.HTTPException, AttributeError):
-            pass
-
-@client.tree.command(name="knock-knock", description="Knock on someone's door: will they give you a Treat or play a Trick?")
-@app_commands.describe(user="Whose door do you want to knock on?")
-@app_commands.guild_only()
-async def knock_knock(interaction: discord.Interaction, user: discord.Member):
-    knocker = interaction.user
-    guild_id = interaction.guild.id
-
-    if not tot_is_active():
-        await interaction.response.send_message("The Trick or Treat event isn't running right now.", ephemeral=True)
-        return
-    if user.id == knocker.id:
-        await interaction.response.send_message("You can't knock on your own door!", ephemeral=True)
-        return
-    if user.bot:
-        await interaction.response.send_message("Bots don't open doors, pick a person!", ephemeral=True)
-        return
-
-    now = time.time()
-    left = KNOCK_COOLDOWN - (now - knock_last.get(knocker.id, 0))
-    if left > 0:
-        await interaction.response.send_message(f"Your knuckles need a rest! Try again in {int(left // 60)}m {int(left % 60) + 1}s.", ephemeral=True)
-        return
-    left = KNOCK_PAIR_COOLDOWN - (now - knock_pair_last.get((knocker.id, user.id), 0))
-    if left > 0:
-        await interaction.response.send_message(f"You already knocked on that door. Try again in {int(left // 60) + 1} minutes.", ephemeral=True)
-        return
-    if user.id in pending_knocks:
-        await interaction.response.send_message("That door already has a visitor, wait a moment!", ephemeral=True)
-        return
-
-    ensure_treat_starter(guild_id, knocker.id)
-    ensure_treat_starter(guild_id, user.id)
-
-    knock_last[knocker.id] = now
-    knock_pair_last[(knocker.id, user.id)] = now
-    pending_knocks.add(user.id)
-    schedule_reminder(guild_id, knocker.id, "knock", KNOCK_COOLDOWN)
-
-    view = KnockView(knocker, user)
-    embed = discord.Embed(
-        title="Knock knock!",
-        description=f"{knocker.mention} knocks on {user.mention}'s door...\n\n**Trick or treat?**",
-        colour=PINK,
-    )
-    await interaction.response.send_message(
-        content=user.mention, embed=embed, view=view,
-        allowed_mentions=discord.AllowedMentions(users=[user]),
-    )
-    view.message = await interaction.original_response()
-
 def treat_grid(names: list[str]) -> str:
     """Treat names in rows of three."""
     if not names: return "Nothing here"
@@ -2549,176 +2205,15 @@ async def inventory(interaction: discord.Interaction, user: discord.Member | Non
     if target.bot:
         await interaction.response.send_message("Bots don't collect treats.", ephemeral=True)
         return
-    guild_id = interaction.guild.id
-    ensure_treat_starter(guild_id, target.id)
-    owned = db.get_treats(guild_id, target.id)
-
+    owned = db.get_treats(interaction.guild.id, target.id)
     owned_names = [f"{name} (x{owned[key]})" if owned[key] > 1 else name for key, name in TREATS if key in owned]
-    missing_names = [name for key, name in TREATS if key not in owned]
 
     embed = discord.Embed(
         title=f"{target.display_name}'s Inventory",
-        description=(
-            f"**Treats Owned -**\n{treat_grid(owned_names)}\n\n"
-            f"**Treats Missing -**\n{treat_grid(missing_names)}\n\n"
-            f"**{len(owned)}/{len(TREAT_KEYS)}**\n"
-            f"Karma {db.get_karma(guild_id, target.id)}"
-        ),
+        description=f"**Treats Owned -**\n{treat_grid(owned_names)}\n\n**{len(owned)}/{len(TREATS)}**",
         colour=CREAM,
     )
     await interaction.response.send_message(embed=embed, view=InventoryView())
-
-search_group = app_commands.Group(name="search", description="Search the server", guild_only=True)
-
-@search_group.command(name="treat", description="See who owns a treat")
-@app_commands.describe(treat="Which treat to look for")
-@app_commands.choices(treat=[app_commands.Choice(name=name, value=key) for key, name in TREATS])
-async def search_treat(interaction: discord.Interaction, treat: str):
-    guild = interaction.guild
-    lines = []
-    total = 0
-    for user_id, copies in db.treat_holders(guild.id, treat):
-        member = guild.get_member(user_id)
-        if member is None: continue
-        total += 1
-        if len(lines) < 30:
-            lines.append(f"**#{len(lines) + 1}** {member.display_name} | x{copies}")
-    if total > len(lines):
-        lines.append(f"...and {total - len(lines)} more")
-    embed = discord.Embed(
-        title=f"Who has {treat_name(treat)}?",
-        description="\n".join(lines) if lines else "Nobody has this treat yet.",
-        colour=PINK,
-    )
-    embed.set_footer(text=f"{total} critter{'s' if total != 1 else ''} with this treat")
-    await interaction.response.send_message(embed=embed)
-
-client.tree.add_command(search_group)
-
-@client.tree.command(name="treatboard", description="Shows who collected the most treats")
-@app_commands.guild_only()
-async def treatboard(interaction: discord.Interaction):
-    guild = interaction.guild
-    lines = []
-    for user_id, different, copies in db.treat_stats(guild.id, 50):
-        member = guild.get_member(user_id)
-        if member is None: continue
-        lines.append(f"**#{len(lines) + 1}** {member.display_name} | {different}/{len(TREAT_KEYS)} treats ({copies} in total)")
-        if len(lines) == 10: break
-    embed = discord.Embed(
-        title="Treat Leaderboard",
-        description="\n".join(lines) if lines else "Nobody has treats yet. Use /knock-knock!",
-        colour=PINK,
-    )
-    await interaction.response.send_message(embed=embed)
-
-@client.tree.command(name="karmastats", description="See your karma and the kindest critters")
-@app_commands.guild_only()
-async def karmastats(interaction: discord.Interaction):
-    guild = interaction.guild
-    mine = db.get_karma(guild.id, interaction.user.id)
-    lines = []
-    for user_id, karma in db.top_karma(guild.id, 50):
-        member = guild.get_member(user_id)
-        if member is None: continue
-        lines.append(f"**#{len(lines) + 1}** {member.display_name} | {karma} karma")
-        if len(lines) == 10: break
-    board = "\n".join(lines) if lines else "Nobody has karma yet. Be kind!"
-    embed = discord.Embed(
-        title="Karma",
-        description=f"Your karma: **{mine}**\n\n**Kindest critters:**\n{board}\n\n"
-                    f"The kindest one gets the **{LOVELY_HORNET_ROLE}** role when the event ends.",
-        colour=PINK,
-    )
-    await interaction.response.send_message(embed=embed)
-
-@client.tree.command(name="tot_start", description="Start the Trick or Treat event (admins only)")
-@app_commands.default_permissions(administrator=True)
-@app_commands.guild_only()
-async def tot_start(interaction: discord.Interaction):
-    if not is_server_admin(interaction):
-        await interaction.response.send_message("Only the server creator or admins can do this.", ephemeral=True)
-        return
-    if tot_is_active():
-        await interaction.response.send_message("The event is already running. Use /tot_end first.", ephemeral=True)
-        return
-
-    await interaction.response.defer()
-    guild = interaction.guild
-    db.reset_karma(guild.id)   # karma starts from zero, treats are kept
-    for member in guild.members:
-        if member.bot or db.tot_has_starter(guild.id, member.id): continue
-        db.tot_give_starter(guild.id, member.id, random.choice(TREAT_KEYS))
-    db.set_setting("tot_active", "1")
-    pending_knocks.clear(); knock_last.clear(); knock_pair_last.clear(); trick_last.clear()
-
-    embed = discord.Embed(
-        title="Trick or Treat has started!",
-        description=(
-            f"Everyone who has no treat yet just got **one random treat** out of {len(TREAT_KEYS)}.\n\n"
-            "Use **/knock-knock @user** to knock on someone's door. They choose **Treat** (you get a treat, "
-            "sometimes one you already own) or **Trick** (50% chance to scare you and steal XP or Mups or Vups, and one of your treats).\n\n"
-            "Check your collection and what every treat does with **/inventory**.\n"
-            "Kind critters earn karma, and the kindest one gets a special role.\n"
-            f"Collect all {len(TREAT_KEYS)} treats to become a **{HORNET_HALLOW_ROLE}**!"
-        ),
-        colour=PINK,
-    )
-    await interaction.followup.send(embed=embed)
-
-@client.tree.command(name="tot_end", description="End the Trick or Treat event and hand out rewards (admins only)")
-@app_commands.default_permissions(administrator=True)
-@app_commands.guild_only()
-async def tot_end(interaction: discord.Interaction):
-    if not is_server_admin(interaction):
-        await interaction.response.send_message("Only the server creator or admins can do this.", ephemeral=True)
-        return
-    if not tot_is_active():
-        await interaction.response.send_message("The event isn't running.", ephemeral=True)
-        return
-
-    await interaction.response.defer()
-    guild = interaction.guild
-    db.set_setting("tot_active", "0")
-    pending_knocks.clear()
-    await finish_treat_pot(guild)
-
-    # Everyone gets a few Mups for every different treat in their collection
-    rewarded = 0
-    completed = 0
-    for user_id, count in db.treat_totals(guild.id):
-        db.add_currency(guild.id, user_id, count * TREAT_END_REWARD_MUPS, 0)
-        rewarded += 1
-        if count >= len(TREAT_KEYS): completed += 1
-
-    # The kindest critter gets the karma role
-    winner_text = "Nobody earned karma this time."
-    top = db.top_karma(guild.id, 1)
-    if top:
-        winner_id, winner_karma = top[0]
-        winner = guild.get_member(winner_id)
-        role = await get_role(guild, LOVELY_HORNET_ROLE)
-        if winner is not None and role is not None:
-            try:
-                for holder in list(role.members):
-                    if holder.id != winner.id:
-                        await holder.remove_roles(role, reason="New kindest critter")
-                await winner.add_roles(role, reason="Most karma in the Trick or Treat event")
-                winner_text = f"The kindest critter is {winner.mention} with **{winner_karma} karma**! They got the **{role.name}** role."
-            except (discord.Forbidden, discord.HTTPException):
-                winner_text = f"The kindest critter is {winner.mention} with {winner_karma} karma, but I couldn't give the role. Please tell a mod."
-
-    embed = discord.Embed(
-        title="Trick or Treat is over!",
-        description=(
-            f"Thank you for playing! Everyone received **{TREAT_END_REWARD_MUPS} Mups per different treat** they collected "
-            f"({rewarded} players).\n"
-            f"Players who found all {len(TREAT_KEYS)} treats: **{completed}**.\n\n{winner_text}\n\n"
-            "Your treats stay in /inventory and their buffs keep working."
-        ),
-        colour=PINK,
-    )
-    await interaction.followup.send(embed=embed)
 
 
 # ======================================================================
@@ -2729,7 +2224,7 @@ async def tot_end(interaction: discord.Interaction):
 @app_commands.guild_only()
 async def reminders(interaction: discord.Interaction, enabled: bool):
     db.set_flag(interaction.guild.id, interaction.user.id, "reminders_off", 0 if enabled else 1)
-    text = ("Reminders are on. I will send you a private message when /daily, /knock-knock or /award_cookie is ready again."
+    text = ("Reminders are on. I will send you a private message when /daily or /award_cookie is ready again."
             if enabled else "Reminders are off. I won't message you about cooldowns.")
     await interaction.response.send_message(embed=discord.Embed(description=text, colour=CREAM), ephemeral=True)
 
@@ -2960,7 +2455,7 @@ class ShopView(discord.ui.View):
         guild = self.member.guild
         data = db.get(guild.id, self.member.id)
         if self.category is None:
-            desc = "Welcome in! Pick a pack below to see what's on the shelves.\n\n✨ **NEW:** Expie Pack, just arrived!\n🎃 **LIMITED:** Halloween Pack, available until Nov 3!"
+            desc = "Welcome in! Pick a pack below to see what's on the shelves.\n\n✨ **NEW:** Expie Pack, just arrived!"
             embed = discord.Embed(title="Silly Shop", description=desc, colour=CREAM)
             embed.set_footer(text="Boosters get 1.5x Mups and Vups!")
         else:
@@ -3110,6 +2605,72 @@ async def test_welcome(interaction: discord.Interaction):
 
 
 # ======================================================================
+#  Art channel: automatic heart + art likes from reactions
+# ======================================================================
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+
+def message_has_art(message: discord.Message) -> bool:
+    for attachment in message.attachments:
+        if (attachment.content_type or "").startswith("image/") or attachment.filename.lower().endswith(IMAGE_EXTENSIONS):
+            return True
+    for embed in message.embeds:
+        if embed.type in ("image", "gifv") or embed.image or embed.thumbnail:
+            return True
+    return False
+
+def in_art_channel(payload) -> bool:
+    return payload.guild_id == GUILD_ID and payload.channel_id == ART_CHANNEL_ID
+
+@client.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if not in_art_channel(payload) or payload.user_id == client.user.id: return
+    channel = client.get_channel(payload.channel_id)
+    if channel is None: return
+    emoji = str(payload.emoji)
+
+    # A moderator puts the cross: all reactions and likes of this message are removed
+    if emoji == ART_REMOVE_EMOJI:
+        if payload.member is None or not is_moderator(payload.member): return
+        try:
+            message = await channel.fetch_message(payload.message_id)
+            await message.clear_reactions()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+        db.clear_art_likes(payload.message_id)
+        return
+
+    # Somebody else puts a heart: it counts as a like for the artist
+    if emoji not in ART_LIKE_EMOJIS: return
+    if payload.member is not None and payload.member.bot: return
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return
+    if message.author.bot or message.author.id == payload.user_id or not message_has_art(message): return
+    db.add_art_like(payload.guild_id, message.id, message.author.id, payload.user_id)
+
+@client.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    if in_art_channel(payload) and str(payload.emoji) in ART_LIKE_EMOJIS:
+        db.remove_art_like(payload.message_id, payload.user_id)
+
+@client.event
+async def on_raw_reaction_clear(payload: discord.RawReactionClearEvent):
+    if in_art_channel(payload):
+        db.clear_art_likes(payload.message_id)
+
+@client.event
+async def on_raw_reaction_clear_emoji(payload: discord.RawReactionClearEmojiEvent):
+    if in_art_channel(payload) and str(payload.emoji) in ART_LIKE_EMOJIS:
+        db.clear_art_likes(payload.message_id)
+
+@client.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    if in_art_channel(payload):
+        db.clear_art_likes(payload.message_id)
+
+
+# ======================================================================
 #  Hug and pat
 # ======================================================================
 ACTION_COOLDOWN = 15
@@ -3245,629 +2806,209 @@ async def pat(interaction: discord.Interaction, user: discord.Member):
     await run_action(interaction, "pat", user)
 
 # ======================================================================
-#  Event part 3: Mystery Box, Treat Pot, Witch's Cauldron, event roles
+#  Applications (staff and other roles)
 # ======================================================================
-def find_text_channel(guild: discord.Guild, keyword: str, channel_id: int = 0):
-    """Channel by id (if set) or the first text channel whose name contains the keyword."""
-    if channel_id:
-        channel = guild.get_channel(channel_id)
+APPLICATIONS_CHANNEL_ID = int(os.getenv("APPLICATIONS_CHANNEL_ID", "1567561731063029881"))
+# Where finished applications are sent for the staff (0 = the mod-log channel)
+APPLICATIONS_LOG_CHANNEL_ID = int(os.getenv("APPLICATIONS_LOG_CHANNEL_ID", "0"))
+APPLICATION_COOLDOWN = 7 * 24 * 3600     # the same person can send the same application once a week
+APPLICATION_MIN_ANSWER = 20              # minimum characters per answer
+APPLICATION_MAX_ANSWER = 900             # maximum characters per answer
+
+# Every application: a name and up to 5 questions as (title up to 45 characters, hint up to 100 characters).
+# TODO: the questions below are only placeholders, replace them with the real ones.
+APPLICATIONS = {
+    "gamenight_hoster": {
+        "name": "Gamenight Hoster",
+        "questions": [
+            ("Do you know how to communicate?", "Your expirience with people."),
+            ("Which games can you host?", "Name the games and how you would run them."),
+            ("How active can you host gamenights?", "Days, hours and ur time zone."),
+        ],
+    },
+    "moderator": {
+        "name": "Moderator",
+        "questions": [
+            ("Why do you want to be a Mod here?", "What makes you want to help our specific community?"),
+            ("Do you know our Rules at least 50%?", "We might test you in voice!"),
+            ("How do you handle a heated argument?", "Two members are fighting in chat. Your actions?"),
+            ("What if your friend breaks the rules?", "How do you stay fair and unbiased?"),
+            ("Do you have prior mod experience?", "Tell us about servers or mod bots you have used."),
+        ],
+    },
+    "minecraft_moderator": {
+        "name": "Minecraft Moderator",
+        "questions": [
+            ("Why do you want this role?", "Tell us in detail why you want to moderate our Minecraft server."),
+            ("Minecraft moderation experience?", "Servers, plugins and tools you know."),
+            ("How active can you be?", "Days, hours and time zone."),
+            ("What if someone steal smt from you?", "What are you gonna do?"),
+            ("What if you saw NSFW/18+ actions?", "What are you gonna do?"),
+        ],
+    },
+}
+APPLICATION_CHOICES = [app_commands.Choice(name=data["name"], value=key) for key, data in APPLICATIONS.items()]
+
+def enabled_applications() -> list[str]:
+    """The applications that are shown in the applications message right now."""
+    raw = db.get_setting("apps_enabled", ",".join(APPLICATIONS))
+    return [key for key in raw.split(",") if key in APPLICATIONS]
+
+def application_cooldown_left(guild_id: int, user_id: int, key: str, now: float) -> int:
+    last = db.get_flag(guild_id, user_id, f"app_{key}_last")
+    return max(0, int(APPLICATION_COOLDOWN - (now - last)))
+
+def get_applications_log_channel(guild: discord.Guild):
+    if APPLICATIONS_LOG_CHANNEL_ID:
+        channel = guild.get_channel(APPLICATIONS_LOG_CHANNEL_ID)
         if channel is not None: return channel
-    return discord.utils.find(
-        lambda c: isinstance(c, discord.TextChannel) and keyword in c.name.lower(), guild.channels
-    )
+    return get_mod_log_channel(guild)
 
-# ---------------------------- Event roles in the profile ----------------------------
-class EventRoleSelect(discord.ui.Select):
-    """Lets people put their event roles on and off. Taken-off roles are remembered, so they can come back."""
-    def __init__(self, member: discord.Member, roles: list, row: int):
-        held = set(member.roles)
-        options = [discord.SelectOption(label=role.name[:100], value=str(role.id), default=(role in held))
-                   for role in roles]
-        super().__init__(placeholder="Show your event roles!", min_values=0, max_values=len(options),
-                         options=options, row=row)
-        self.event_roles = roles
-
-    async def callback(self, interaction: discord.Interaction):
-        member = interaction.user
-        chosen = {int(value) for value in self.values}
-        wanted = {role for role in self.event_roles if role.id in chosen}
-        held = set(member.roles)
-        to_add = list(wanted - held)
-        to_remove = list((set(self.event_roles) & held) - wanted)
-        for role in to_remove:
-            db.mark_earned(member.guild.id, member.id, role.name)
-        try:
-            if to_add: await member.add_roles(*to_add, reason="Event roles")
-            if to_remove: await member.remove_roles(*to_remove, reason="Event roles")
-        except (discord.Forbidden, discord.HTTPException):
-            await interaction.response.send_message("I can't change those roles. Please tell a mod to move my role higher.", ephemeral=True)
-            return
-        for option in self.options:
-            option.default = int(option.value) in chosen
-        await interaction.response.edit_message(content="Saved! You can change this any time.", view=self.view)
-
-def add_event_role_select(view: discord.ui.View, member: discord.Member, row: int):
-    earned = db.earned_roles(member.guild.id, member.id)
-    roles, seen = [], set()
-    for entry in EVENT_NAME_EMOJIS:
-        role = find_role(member.guild, entry["role"])
-        if role is None or role.id in seen: continue
-        if role in member.roles or entry["role"] in earned:
-            seen.add(role.id)
-            roles.append(role)
-    if roles:
-        view.add_item(EventRoleSelect(member, roles, row))
-
-
-# ---------------------------- Mystery box ----------------------------
-BOX_INTERVAL = 600     # a new box every 10 minutes while the event runs
-BOX_OUTCOMES = [("nothing", 12), ("mups", 23), ("xp", 18), ("shop", 9),
-                ("treat", 14), ("steal", 9), ("lose", 7), ("bomb", 8)]
-BOX_ALL_TREATS_MUPS = 100
-
-def box_embed(text: str) -> discord.Embed:
-    return discord.Embed(title="Mystery box", description=text, colour=PINK)
-
-async def post_mystery_box(guild: discord.Guild) -> bool:
-    channel = find_text_channel(guild, "general", GENERAL_CHANNEL_ID)
-    if channel is None: return False
-    try:
-        message = await channel.send(
-            embed=box_embed("**Wowwie! Strange cat left mysterious box here!**"), view=MysteryBoxView()
-        )
-    except (discord.Forbidden, discord.HTTPException):
-        return False
-    db.add_box(message.id, channel.id)
-    return True
-
-async def run_box(interaction: discord.Interaction):
-    guild = interaction.guild
-    member = interaction.user
-    message = interaction.message
-    channel = message.channel
-    mention = member.mention
-
-    async def show(text: str):
-        try: await interaction.edit_original_response(embed=box_embed(text), view=None)
-        except (discord.NotFound, discord.HTTPException): pass
-
-    outcome = random.choices([k for k, _ in BOX_OUTCOMES], weights=[w for _, w in BOX_OUTCOMES])[0]
-
-    if outcome == "shop":
-        pool = [item for cat in get_active_shop_categories().values() for item in cat["items"] if item["key"] != "wyphlet"]
-        random.shuffle(pool)
-        for item in pool:
-            role = find_shop_role(guild, item["role"])
-            if role is None or role in member.roles: continue
-            try: await member.add_roles(role, reason="Mystery box")
-            except (discord.Forbidden, discord.HTTPException): continue
-            await show(f"There was **{item['name']}** in the box, congratulations {mention}!")
-            return
-        outcome = "mups"
-
-    if outcome == "treat":
-        owned = db.get_treats(guild.id, member.id)
-        missing = [key for key in TREAT_KEYS if key not in owned]
-        if missing:
-            key = random.choice(missing)
-            db.add_treat(guild.id, member.id, key)
-            text = f"{mention}, there was a **{treat_name(key)}** treat! Yay!!"
-            if await check_hornet_hallow(guild, member):
-                text += f"\n{mention} collected every treat and became a **{HORNET_HALLOW_ROLE}**!"
-            await show(text)
-            return
-        db.add_currency(guild.id, member.id, BOX_ALL_TREATS_MUPS, 0)
-        await show(f"{mention}, you already have every treat, so the box gave you **{BOX_ALL_TREATS_MUPS} Mups** instead!")
-        return
-
-    if outcome == "steal":
-        mine = db.get_treats(guild.id, member.id)
-        options = [(uid, key) for uid, key in db.treats_of_others(guild.id, member.id)
-                   if key not in mine and guild.get_member(uid) is not None]
-        if options:
-            uid, key = random.choice(options)
-            victim = guild.get_member(uid)
-            db.remove_treat(guild.id, uid, key)
-            db.add_treat(guild.id, member.id, key)
-            text = f"{mention} sneaked a **{treat_name(key)}** treat out of {victim.mention}'s pocket!"
-            if await check_hornet_hallow(guild, member):
-                text += f"\n{mention} collected every treat and became a **{HORNET_HALLOW_ROLE}**!"
-            await show(text)
-            return
-        outcome = "mups"
-
-    if outcome == "lose":
-        others = [m for m in guild.members if not m.bot and m.id != member.id]
-        if not others:
-            outcome = "nothing"
-        else:
-            other = random.choice(others)
-            taken = db.steal_currency(guild.id, member.id, other.id, random.randint(10, 40), "mups")
-            if taken:
-                await show(f"{mention}, you lost {fmt_num(taken)} Mups! They were given to {other.mention}")
-            else:
-                await show(f"A paw reached out to take {mention}'s Mups, but the pockets were empty!")
-            return
-
-    if outcome == "bomb":
-        for number in (5, 4, 3, 2, 1):
-            await show(f"BOMB... IT EXPLODES IN {number}")
-            await asyncio.sleep(1)
-        removed = 0
-        try:
-            doomed = []
-            async for old in channel.history(limit=50):
-                if old.id == message.id or old.pinned: continue
-                doomed.append(old)
-                if len(doomed) == 10: break
-            if len(doomed) >= 2: await channel.delete_messages(doomed)
-            elif doomed: await doomed[0].delete()
-            removed = len(doomed)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-        text = f"BOOM! {mention} opened a bomb!"
-        if removed: text += f" The last {removed} messages were blown away."
-        await show(text)
-        return
-
-    if outcome == "xp":
-        await give_xp(member, 200)
-        await show(f"{mention} !! 200 xp was in this box! Great ^^")
-    elif outcome == "nothing":
-        await show(f"{mention} ... There was nothing.. sadly ~w~..")
-    else:   # mups
-        amount = random.randint(10, 100)
-        db.add_currency(guild.id, member.id, amount, 0)
-        await show(f"Wow {mention}!! You found {amount} Mups!")
-
-class MysteryBoxView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Open", style=discord.ButtonStyle.primary, custom_id="mystery_box_open")
-    async def open_box(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not db.claim_box(interaction.message.id, interaction.user.id):
-            await interaction.response.send_message("Someone was faster, this box is already open!", ephemeral=True)
-            return
-        await interaction.response.defer()
-        try:
-            await run_box(interaction)
-        except Exception as error:
-            print(f"Mystery box failed: {error!r}")
-            try:
-                await interaction.edit_original_response(
-                    embed=box_embed("The box fell apart... nothing came out. Sowwee ~w~"), view=None)
-            except (discord.NotFound, discord.HTTPException):
-                pass
-
-@tasks.loop(seconds=30)
-async def mystery_box_loop():
-    guild = client.get_guild(GUILD_ID)
-    if guild is None or not tot_is_active(): return
-    now = time.time()
-    if now - float(db.get_setting("box_last", "0")) < BOX_INTERVAL: return
-    db.set_setting("box_last", str(now))
-    await post_mystery_box(guild)
-
-@mystery_box_loop.before_loop
-async def before_mystery_box_loop():
-    await client.wait_until_ready()
-
-spawn_group = app_commands.Group(
-    name="spawn", description="Spawn event things (admins only)",
-    default_permissions=discord.Permissions(administrator=True), guild_only=True,
-)
-
-@spawn_group.command(name="box", description="Spawn a mystery box right now (does not change the 10 minute timer)")
-async def spawn_box(interaction: discord.Interaction):
-    if not is_server_admin(interaction):
-        await interaction.response.send_message("Only the server creator or admins can do this.", ephemeral=True)
-        return
-    if await post_mystery_box(interaction.guild):
-        await interaction.response.send_message("The box was spawned.", ephemeral=True)
-    else:
-        await interaction.response.send_message("I couldn't post in the general channel.", ephemeral=True)
-
-client.tree.add_command(spawn_group)
-
-
-# ---------------------------- Treat Pot ----------------------------
-POT_XP, POT_MUPS, POT_VUPS = 15, 3, 2     # one treat in the pot
-
-def pot_pools(treats: int) -> tuple[int, int, int]:
-    return treats * POT_XP, treats * POT_MUPS, treats * POT_VUPS
-
-def build_pot_embed(guild_id: int, closed: bool = False) -> discord.Embed:
-    treats, investors = db.pot_totals(guild_id)
-    xp_pool, mups_pool, vups_pool = pot_pools(treats)
-    xp_each = xp_pool // investors if investors else 0
-    mups_each = round(mups_pool / investors, 2) if investors else 0
-    vups_each = round(vups_pool / investors, 2) if investors else 0
-    embed = discord.Embed(
-        title="TREAT POT" + (" (closed)" if closed else ""),
-        description="Put your treats here! At the end of the event, all treats will turn into XP, Mups and Vups! "
-                    "Then split equally between everyone who invested their treats!",
+def build_applications_embed() -> discord.Embed:
+    return discord.Embed(
+        title="APPLICATIONS ON STAFF/OTHER ROLES",
+        description=(
+            "There you can make an application for role on our server!\n"
+            "Please pick that you really will able to do and fits your mood, do not pick just to be the cool guy.\n"
+            "Then you click on this button, you can pick avaible (For now) applications!\n\n"
+            "**Choose an aplication!**"
+        ),
         colour=CREAM,
     )
-    embed.add_field(name="Treats", value=f"{treats:,}", inline=True)
-    embed.add_field(name="Investors", value=f"{investors:,}", inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=True)
-    embed.add_field(name="Xp Per user", value=f"{xp_each:,}", inline=True)
-    embed.add_field(name="Mups Per user", value=fmt_num(mups_each), inline=True)
-    embed.add_field(name="Vups Per user", value=fmt_num(vups_each), inline=True)
-    embed.set_footer(text=f"Treats Calculation: 1 treat = {POT_XP} XP, {POT_MUPS} Mups, {POT_VUPS} Vups")
-    return embed
 
-async def update_pot_message(guild: discord.Guild, closed: bool = False):
-    channel_id = int(db.get_setting("pot_channel", "0"))
-    message_id = int(db.get_setting("pot_message", "0"))
-    channel = guild.get_channel(channel_id) if channel_id else None
-    if channel is None or not message_id: return
-    try:
-        message = await channel.fetch_message(message_id)
-        await message.edit(embed=build_pot_embed(guild.id, closed), view=None if closed else TreatPotView())
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        pass
+class ApplicationModal(discord.ui.Modal):
+    def __init__(self, key: str):
+        data = APPLICATIONS[key]
+        super().__init__(title=f"Application: {data['name']}"[:45])
+        self.key = key
+        self.fields: list[tuple[str, discord.ui.TextInput]] = []
+        for title, hint in data["questions"][:5]:
+            field = discord.ui.TextInput(
+                label=title[:45], placeholder=hint[:100], style=discord.TextStyle.paragraph,
+                required=True, min_length=APPLICATION_MIN_ANSWER, max_length=APPLICATION_MAX_ANSWER,
+            )
+            self.add_item(field)
+            self.fields.append((title, field))
 
-class PotTreatSelect(discord.ui.Select):
-    def __init__(self, pot: "PotInsertView", owned: dict):
-        options = [discord.SelectOption(label=f"{name} (x{owned[key]})", value=key, default=(key == pot.treat))
-                   for key, name in TREATS if key in owned]
-        super().__init__(placeholder="Pick a treat to insert", options=options[:25], row=0)
-        self.pot = pot
-
-    async def callback(self, interaction: discord.Interaction):
-        self.pot.treat = self.values[0]
-        self.pot.amount = None
-        self.pot.build()
-        await interaction.response.edit_message(embed=self.pot.make_embed(), view=self.pot)
-
-class PotAmountSelect(discord.ui.Select):
-    def __init__(self, pot: "PotInsertView", count: int):
-        options = [discord.SelectOption(label=str(i), value=str(i), default=(i == pot.amount))
-                   for i in range(1, min(count, 25) + 1)]
-        super().__init__(placeholder="Pick an amount", options=options, row=1)
-        self.pot = pot
-
-    async def callback(self, interaction: discord.Interaction):
-        self.pot.amount = int(self.values[0])
-        self.pot.build()
-        await interaction.response.edit_message(embed=self.pot.make_embed(), view=self.pot)
-
-class PotConfirmButton(discord.ui.Button):
-    def __init__(self, pot: "PotInsertView"):
-        super().__init__(label="Insert!", style=discord.ButtonStyle.success, row=2)
-        self.pot = pot
-
-    async def callback(self, interaction: discord.Interaction):
+    async def on_submit(self, interaction: discord.Interaction):
         guild = interaction.guild
         member = interaction.user
-        if not tot_is_active():
-            await interaction.response.edit_message(embed=discord.Embed(description="The pot is closed.", colour=CREAM), view=None)
+        data = APPLICATIONS[self.key]
+        now = time.time()
+
+        if self.key not in enabled_applications():
+            await interaction.response.send_message("This application isn't open anymore, sorry!", ephemeral=True)
             return
-        have = db.get_treats(guild.id, member.id).get(self.pot.treat, 0)
-        amount = min(self.pot.amount, have)
-        if amount <= 0:
-            await interaction.response.edit_message(embed=discord.Embed(description="You don't have that treat anymore.", colour=CREAM), view=None)
+        if application_cooldown_left(guild.id, member.id, self.key, now) > 0:
+            await interaction.response.send_message("You already sent this application recently. Please wait before sending it again.", ephemeral=True)
             return
-        db.remove_treats(guild.id, member.id, self.pot.treat, amount)
-        db.pot_add(guild.id, member.id, amount)
-        await interaction.response.edit_message(
-            embed=discord.Embed(description=f"You put {amount}x **{treat_name(self.pot.treat)}** into the pot. Thank you!", colour=PINK),
-            view=None,
+        channel = get_applications_log_channel(guild)
+        if channel is None:
+            await interaction.response.send_message("I can't find where to send your application. Please tell a mod.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title=f"New application: {data['name']}",
+            description=f"From {member.mention} ({member})",
+            colour=PINK,
         )
-        await update_pot_message(guild)
+        embed.set_thumbnail(url=member.display_avatar.url)
+        for title, field in self.fields:
+            embed.add_field(name=title[:256], value=field.value[:1024], inline=False)
+        embed.set_footer(text=f"User ID: {member.id}")
+        try:
+            await channel.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            await interaction.response.send_message("I couldn't send your application. Please tell a mod.", ephemeral=True)
+            return
 
-class PotInsertView(discord.ui.View):
-    def __init__(self, member: discord.Member):
-        super().__init__(timeout=300)
-        self.member = member
-        self.treat: str | None = None
-        self.amount: int | None = None
-        self.build()
+        db.set_flag(guild.id, member.id, f"app_{self.key}_last", now)
+        await interaction.response.send_message(
+            f"Your application for **{data['name']}** was sent! The staff will look at it, thank you :3", ephemeral=True)
 
-    def build(self):
-        self.clear_items()
-        owned = db.get_treats(self.member.guild.id, self.member.id)
-        self.add_item(PotTreatSelect(self, owned))
-        if self.treat and owned.get(self.treat, 0) > 0:
-            self.add_item(PotAmountSelect(self, owned[self.treat]))
-            if self.amount:
-                self.add_item(PotConfirmButton(self))
+class ApplicationSelect(discord.ui.Select):
+    def __init__(self):
+        options = [discord.SelectOption(label=APPLICATIONS[key]["name"], value=key) for key in enabled_applications()]
+        super().__init__(placeholder="Choose an application!", options=options, min_values=1, max_values=1)
 
-    def make_embed(self) -> discord.Embed:
-        text = "Pick a treat to insert, then pick an amount.\nInserted treats are gone for good, and so are their buffs."
-        if self.treat: text += f"\n\nTreat: **{treat_name(self.treat)}**"
-        if self.amount: text += f"\nAmount: **{self.amount}**"
-        return discord.Embed(title="Insert a treat", description=text, colour=CREAM)
+    async def callback(self, interaction: discord.Interaction):
+        key = self.values[0]
+        if key not in enabled_applications():
+            await interaction.response.send_message("This application isn't open anymore, sorry!", ephemeral=True)
+            return
+        left = application_cooldown_left(interaction.guild.id, interaction.user.id, key, time.time())
+        if left > 0:
+            await interaction.response.send_message(
+                f"You already sent this application. You can send it again in {left // 86400 + 1} day(s).", ephemeral=True)
+            return
+        await interaction.response.send_modal(ApplicationModal(key))
 
-class TreatPotView(discord.ui.View):
+class ApplicationsView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Insert a treat!", style=discord.ButtonStyle.success, custom_id="treat_pot_insert")
-    async def insert(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not tot_is_active():
-            await interaction.response.send_message("The pot is closed.", ephemeral=True)
+    @discord.ui.button(label="Apply!", style=discord.ButtonStyle.primary, custom_id="applications_open_button")
+    async def open_list(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not enabled_applications():
+            await interaction.response.send_message("There are no open applications right now. Come back later!", ephemeral=True)
             return
-        if not db.get_treats(interaction.guild.id, interaction.user.id):
-            await interaction.response.send_message("You don't have any treats to insert.", ephemeral=True)
-            return
-        view = PotInsertView(interaction.user)
-        await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
+        view = discord.ui.View(timeout=300)
+        view.add_item(ApplicationSelect())
+        await interaction.response.send_message("Pick the application you want to fill in:", view=view, ephemeral=True)
 
-@client.tree.command(name="treat_pot_setup", description="Post the Treat Pot message in the treat-pot channel (admins only)")
+@client.tree.command(name="setup_applications", description="Post the applications message in the applications channel (admins only)")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
-async def treat_pot_setup(interaction: discord.Interaction):
+async def setup_applications(interaction: discord.Interaction):
     if not is_server_admin(interaction):
         await interaction.response.send_message("Only the server creator or admins can do this.", ephemeral=True)
         return
-    guild = interaction.guild
-    channel = find_text_channel(guild, "treat-pot", TREAT_POT_CHANNEL_ID)
+    channel = interaction.guild.get_channel(APPLICATIONS_CHANNEL_ID)
     if channel is None:
-        await interaction.response.send_message("I can't find the treat-pot channel.", ephemeral=True)
+        await interaction.response.send_message("I can't find the applications channel.", ephemeral=True)
         return
     try:
-        message = await channel.send(embed=build_pot_embed(guild.id), view=TreatPotView())
+        await channel.send(embed=build_applications_embed(), view=ApplicationsView())
     except (discord.Forbidden, discord.HTTPException):
         await interaction.response.send_message("I can't post in that channel.", ephemeral=True)
         return
-    db.set_setting("pot_channel", str(channel.id))
-    db.set_setting("pot_message", str(message.id))
-    await interaction.response.send_message(f"Treat Pot posted in {channel.mention}.", ephemeral=True)
+    await interaction.response.send_message(f"Applications message posted in {channel.mention}.", ephemeral=True)
 
-async def finish_treat_pot(guild: discord.Guild):
-    """Turns the pot into XP, Mups and Vups, splits it equally between the investors and announces it."""
-    treats, investors = db.pot_totals(guild.id)
-    channel = find_text_channel(guild, "treat-pot", TREAT_POT_CHANNEL_ID)
-    if treats == 0 or investors == 0:
-        db.pot_clear(guild.id)
-        await update_pot_message(guild, closed=True)
-        return
-
-    xp_pool, mups_pool, vups_pool = pot_pools(treats)
-    xp_each = xp_pool // investors
-    mups_each = round(mups_pool / investors, 2)
-    vups_each = round(vups_pool / investors, 2)
-
-    mentions = []
-    for user_id, _ in db.pot_list(guild.id):
-        db.add_currency(guild.id, user_id, mups_each, vups_each)
-        member = guild.get_member(user_id)
-        if member is not None:
-            await give_xp(member, xp_each)
-            mentions.append(member.mention)
-        else:
-            db.add_xp(guild.id, user_id, xp_each)
-    db.pot_clear(guild.id)
-
-    text = (f"Treats invested: {treats:,}\nXp in Pot: {xp_pool:,}\nMups In Pot: {mups_pool:,}\nVups in Pot: {vups_pool:,}\n\n"
-            f"You got: {xp_each:,} Xp, {fmt_num(mups_each)} Mups, {fmt_num(vups_each)} Vups.")
-    if mentions:
-        text += "\n\nInvestors: " + " ".join(mentions[:40]) + (" ..." if len(mentions) > 40 else "")
-    await update_pot_message(guild, closed=True)
-    if channel is not None:
-        try:
-            await channel.send(
-                content="@here",
-                embed=discord.Embed(title="TREAT POT EVENT ENDED", description=text, colour=PINK),
-                allowed_mentions=discord.AllowedMentions(everyone=True),
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
-
-# ---------------------------- Witch's Cauldron ----------------------------
-GHOSTLY_CRAFT_LIMIT = 3
-WITCH_ROLE = "Witch"
-
-CAULDRON_RECIPES = {
-    "treat_luck": {"name": "Treat luck!",
-                   "desc": "Buff for 2 hours: while it lasts, your chance of getting a new treat from a Treat is 30% -> 60%.",
-                   "cost": {"pumpkin_cookie": 2, "gloomy_gumdrop": 2}},
-    "ghostly": {"name": "Ghostly Role",
-                "desc": f"Ghost that somehow became a server role.. Only {GHOSTLY_CRAFT_LIMIT} users can obtain this!",
-                "cost": {"ghost_marshmallow": 3, "mummy_muffin": 2}},
-    "strange_xp": {"name": "Strange Xp Boost!",
-                   "desc": "It's.. an xp boost, but not at all..? (1 hour, a random multiplier from x0.5 to x3)",
-                   "cost": {"gloomy_gumdrop": 1}},
-    "witch": {"name": "Witch Role",
-              "desc": "Plehh.. A real witch??",
-              "cost": {"witch_hat_truffle": 4, "bat_wing_gummy": 2, "spooky_lollipop": 2}},
-    "thief_brew": {"name": "Thief's Brew",
-                   "desc": "Your chance to trick someone 50% -> 80% for 6 hours.",
-                   "cost": {"skeleton_biscuit": 2, "cauldron_cocoa": 1}},
-    "ghost_shield": {"name": "Ghost Shield",
-                     "desc": "Get a ghostly shield against the next 3 tricks on you!",
-                     "cost": {"skeleton_biscuit": 2, "ghost_marshmallow": 1}},
-}
-
-def cauldron_offers(now: float) -> list[tuple[str, dict]]:
-    """Changes every hour, and is the same for everybody: 2 random recipes and 1 random treat."""
-    rng = random.Random(int(now // 3600))
-    picks = rng.sample(list(CAULDRON_RECIPES), 2)
-    gives, cost = rng.sample(TREAT_KEYS, 2)
-    offers = [(key, CAULDRON_RECIPES[key]) for key in picks]
-    offers.append(("random_treat", {
-        "name": f"Random Treat: {treat_name(gives)}",
-        "desc": f"A very cool Treat to have! This hour it is {treat_name(gives)}.",
-        "cost": {cost: 2},
-        "gives": gives,
-    }))
-    return offers
-
-def cauldron_minutes_left(now: float) -> int:
-    return 60 - int((now % 3600) // 60)
-
-class CauldronSelect(discord.ui.Select):
-    def __init__(self, cauldron: "CauldronView", offers):
-        options = [discord.SelectOption(label=recipe["name"][:100], value=key, default=(key == cauldron.offer_key))
-                   for key, recipe in offers]
-        super().__init__(placeholder="Open Recipe", options=options, row=0)
-        self.cauldron = cauldron
-
-    async def callback(self, interaction: discord.Interaction):
-        self.cauldron.offer_key = self.values[0]
-        self.cauldron.notice = None
-        self.cauldron.build()
-        await interaction.response.edit_message(embed=self.cauldron.make_embed(), view=self.cauldron)
-
-class CauldronBackButton(discord.ui.Button):
-    def __init__(self, cauldron: "CauldronView"):
-        super().__init__(label="Back", style=discord.ButtonStyle.secondary, row=1)
-        self.cauldron = cauldron
-
-    async def callback(self, interaction: discord.Interaction):
-        self.cauldron.offer_key = None
-        self.cauldron.build()
-        await interaction.response.edit_message(embed=self.cauldron.make_embed(), view=self.cauldron)
-
-class CauldronCombineButton(discord.ui.Button):
-    def __init__(self, cauldron: "CauldronView"):
-        super().__init__(label="Combine!", style=discord.ButtonStyle.success, row=1)
-        self.cauldron = cauldron
-
-    async def callback(self, interaction: discord.Interaction):
-        view = self.cauldron
-        guild = interaction.guild
-        member = interaction.user
-        now = time.time()
-        offers = dict(cauldron_offers(now))
-
-        if view.offer_key not in offers:
-            view.offer_key = None
-            view.notice = "The cauldron was reset! Take a look at the new recipes."
-            view.build()
-            await interaction.response.edit_message(embed=view.make_embed(), view=view)
-            return
-
-        key = view.offer_key
-        recipe = offers[key]
-        owned = db.get_treats(guild.id, member.id)
-        missing = [f"{need - owned.get(treat, 0)}x {treat_name(treat)}"
-                   for treat, need in recipe["cost"].items() if owned.get(treat, 0) < need]
-        if missing:
-            await interaction.response.send_message("You are missing: " + ", ".join(missing), ephemeral=True)
-            return
-
-        # things that can be refused BEFORE we spend anything
-        if key == "ghostly":
-            ghostly = find_role(guild, GHOSTLY_ROLE)
-            if int(db.get_setting("ghostly_crafted", "0")) >= GHOSTLY_CRAFT_LIMIT:
-                await interaction.response.send_message("All Ghostly roles are taken already.", ephemeral=True)
-                return
-            if ghostly is not None and ghostly in member.roles:
-                await interaction.response.send_message("You already have the Ghostly role.", ephemeral=True)
-                return
-        if key == "witch":
-            witch = find_role(guild, WITCH_ROLE)
-            if witch is not None and witch in member.roles:
-                await interaction.response.send_message("You already have the Witch role.", ephemeral=True)
-                return
-
-        for treat, need in recipe["cost"].items():
-            db.remove_treats(guild.id, member.id, treat, need)
-
-        mention = member.mention
-        if key == "treat_luck":
-            db.set_flag(guild.id, member.id, "luck_end", now + 2 * 3600)
-            text = f"{mention} brewed **Treat luck!** For 2 hours you are much more likely to get new treats."
-        elif key == "strange_xp":
-            mult = round(random.uniform(0.5, 3.0), 2)
-            db.set_flag(guild.id, member.id, "strange_xp_end", now + 3600)
-            db.set_flag(guild.id, member.id, "strange_xp_mult", mult)
-            text = f"{mention} drank the **Strange Xp Boost!** Your XP is x{mult} for the next hour!"
-        elif key == "thief_brew":
-            db.set_flag(guild.id, member.id, "brew_end", now + 6 * 3600)
-            text = f"{mention} brewed **Thief's Brew!** Your tricks are much sneakier for 6 hours."
-        elif key == "ghost_shield":
-            left = int(db.get_flag(guild.id, member.id, "shield_n"))
-            db.set_flag(guild.id, member.id, "shield_n", left + 3)
-            text = f"{mention} got a **Ghost Shield!** The next {left + 3} tricks on you will fail."
-        elif key == "random_treat":
-            gives = recipe["gives"]
-            db.add_treat(guild.id, member.id, gives)
-            count = db.get_treats(guild.id, member.id).get(gives, 1)
-            text = f"{mention} combined their treats and got **{treat_name(gives)}**! Now they have {count}."
-            if await check_hornet_hallow(guild, member):
-                text += f"\n{mention} collected every treat and became a **{HORNET_HALLOW_ROLE}**!"
-        else:   # roles
-            role_name = GHOSTLY_ROLE if key == "ghostly" else WITCH_ROLE
-            crafted = int(db.get_setting("ghostly_crafted", "0"))
-            if key == "ghostly":
-                db.set_setting("ghostly_crafted", str(crafted + 1))   # reserve the spot before any await
-            if await grant_role_by_name(member, role_name, "Crafted in the Witch's cauldron"):
-                text = f"{mention} crafted the **{role_name}** role!"
-            else:
-                if key == "ghostly":
-                    db.set_setting("ghostly_crafted", str(crafted))
-                for treat, need in recipe["cost"].items():   # give everything back
-                    for _ in range(need): db.add_treat(guild.id, member.id, treat)
-                text = "I couldn't give you that role, so your treats were returned. Please tell a mod."
-
-        view.offer_key = None
-        view.notice = text
-        view.build()
-        await interaction.response.edit_message(embed=view.make_embed(), view=view)
-
-class CauldronView(discord.ui.View):
-    def __init__(self, member: discord.Member):
-        super().__init__(timeout=600)
-        self.member = member
-        self.offer_key: str | None = None
-        self.notice: str | None = None
-        self.build()
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.member.id: return True
-        await interaction.response.send_message("This is not your cauldron! Type /witchs-cauldron to use your own.", ephemeral=True)
-        return False
-
-    def build(self):
-        self.clear_items()
-        offers = cauldron_offers(time.time())
-        self.add_item(CauldronSelect(self, offers))
-        if self.offer_key:
-            self.add_item(CauldronCombineButton(self))
-            self.add_item(CauldronBackButton(self))
-
-    def make_embed(self) -> discord.Embed:
-        now = time.time()
-        offers = dict(cauldron_offers(now))
-        minutes = cauldron_minutes_left(now)
-        reset = f"[Reset in {minutes} minute{'s' if minutes != 1 else ''}]"
-        notice = f"{self.notice}\n\n" if self.notice else ""
-
-        if self.offer_key in offers:
-            recipe = offers[self.offer_key]
-            owned = db.get_treats(self.member.guild.id, self.member.id)
-            lines, warnings = [], []
-            for treat, need in recipe["cost"].items():
-                have = owned.get(treat, 0)
-                lines.append(f"x{need} {treat_name(treat)} (you have {have})")
-                if have == need:
-                    warnings.append(f"Careful: this uses your last {treat_name(treat)}, and you will lose its buff.")
-            text = f"{notice}**{recipe['name']}** Recipe!\n\n" + "\n".join(lines)
-            if warnings: text += "\n\n" + "\n".join(warnings)
-            text += f"\n\n{reset}"
-        else:
-            parts = []
-            for key, recipe in cauldron_offers(now):
-                extra = ""
-                if key == "ghostly" and int(db.get_setting("ghostly_crafted", "0")) >= GHOSTLY_CRAFT_LIMIT:
-                    extra = " (sold out)"
-                parts.append(f"**{recipe['name']}**{extra}\n{recipe['desc']}")
-            text = (f"{notice}Combine your treats for buffs or other treats!\n\n"
-                    f"**What can you get** {reset}\n\n" + "\n\n".join(parts))
-        return discord.Embed(title="Witch's cauldron", description=text, colour=CREAM)
-
-@client.tree.command(name="witchs-cauldron", description="Combine your treats for buffs, roles and new treats")
+@client.tree.command(name="add", description="Show an application in the applications message (admins only)")
+@app_commands.describe(application="Which application to show")
+@app_commands.choices(application=APPLICATION_CHOICES)
+@app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
-async def witchs_cauldron(interaction: discord.Interaction):
-    # Everybody can see the message, but only the person who used the command can press the buttons
-    view = CauldronView(interaction.user)
-    await interaction.response.send_message(embed=view.make_embed(), view=view)
+async def add_application(interaction: discord.Interaction, application: str):
+    if not is_server_admin(interaction):
+        await interaction.response.send_message("Only the server creator or admins can do this.", ephemeral=True)
+        return
+    enabled = enabled_applications()
+    name = APPLICATIONS[application]["name"]
+    if application in enabled:
+        await interaction.response.send_message(f"**{name}** is already shown.", ephemeral=True)
+        return
+    enabled.append(application)
+    db.set_setting("apps_enabled", ",".join(enabled))
+    await interaction.response.send_message(f"**{name}** is now shown in the applications message.", ephemeral=True)
+
+@client.tree.command(name="remove", description="Hide an application from the applications message (admins only)")
+@app_commands.describe(application="Which application to hide")
+@app_commands.choices(application=APPLICATION_CHOICES)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def remove_application(interaction: discord.Interaction, application: str):
+    if not is_server_admin(interaction):
+        await interaction.response.send_message("Only the server creator or admins can do this.", ephemeral=True)
+        return
+    enabled = enabled_applications()
+    name = APPLICATIONS[application]["name"]
+    if application not in enabled:
+        await interaction.response.send_message(f"**{name}** is already hidden.", ephemeral=True)
+        return
+    enabled.remove(application)
+    db.set_setting("apps_enabled", ",".join(enabled))
+    await interaction.response.send_message(f"**{name}** is now hidden from the applications message.", ephemeral=True)
 
 
 if not TOKEN:

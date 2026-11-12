@@ -35,7 +35,7 @@ ART_REMOVE_EMOJI = "\u274c"                         # the cross mark
 # Chat: pings and meows in chat get a random meow from the bot. When somebody replies to a bot message,
 # the bot answers with the free Google Gemini AI if there is a key in GEMINI_API_KEY (otherwise it meows).
 # Get a free key at https://aistudio.google.com/apikey
-GEMINI_API_KEY = os.getenv("GEMINI_API_KE")
+GEMINI_API_KEY = os.getenv("AQ.Ab8RN6L8s17lJuffxzgjBUo3QuMLvmr6U0RV-lH2H98cNSAGGA")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 CHAT_COOLDOWN = 8                 # seconds between two answers to the same person
 CHAT_HISTORY = 8                  # how many earlier messages the bot reads for context

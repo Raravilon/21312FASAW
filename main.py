@@ -33,12 +33,11 @@ ART_LIKE_EMOJIS = ("\u2764\ufe0f", "\u2764")      # the red heart (with and with
 ART_REMOVE_EMOJI = "\u274c"                         # the cross mark
 
 # Chat: pings and meows in chat get a random meow from the bot. When somebody replies to a bot message
-# (or pings it with some text), the bot answers with the free Google Gemini AI if there is a key in
-# GEMINI_API_KEY (otherwise it meows).
-# Get a free key at https://aistudio.google.com/apikey
-# The old misspelled name GEMINI_API_KE still works too.
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GEMINI_API_KE")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+# (or pings it with some text), the bot answers with the free Groq AI if there is a key in
+# GROQ_API_KEY (otherwise it meows).
+# Get a free key at https://console.groq.com/keys  (never write the key into the code, use the variable)
+AI_API_KEY = os.getenv("GROQ_API_KEY") or "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"
+AI_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 CHAT_COOLDOWN = 8                 # seconds between two answers to the same person
 CHAT_HISTORY = 8                  # how many earlier messages the bot reads for context
 CHAT_MAX_REPLY = 1500             # characters
@@ -1380,10 +1379,10 @@ class SillyBot(discord.Client):
 
     async def on_ready(self):
         print(f"Bot is online as {self.user}")
-        if GEMINI_API_KEY:
-            print(f"AI chat is ON (model: {GEMINI_MODEL})")
+        if AI_API_KEY:
+            print(f"AI chat is ON (model: {AI_MODEL})")
         else:
-            print("AI chat is OFF: no GEMINI_API_KEY variable found, the bot will only meow")
+            print("AI chat is OFF: no GROQ_API_KEY variable found, the bot will only meow")
 
 client = SillyBot()
 
@@ -2925,16 +2924,18 @@ async def build_chat_prompt(message: discord.Message) -> str:
             f"Write your reply to {asker}.")
 
 async def ask_ai(prompt: str) -> str | None:
-    """Asks Google Gemini (free tier). Returns None if there is no answer."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    """Asks Groq (free tier, OpenAI-style API). Returns None if there is no answer."""
+    url = "https://api.groq.com/openai/v1/chat/completions"
     payload = {
-        "systemInstruction": {"parts": [{"text": CHAT_SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        # Newer Gemini models "think" before answering and the thinking uses up the token limit,
-        # so the limit must be generous or the answer comes back empty.
-        "generationConfig": {"maxOutputTokens": 2048, "temperature": 0.9},
+        "model": AI_MODEL,
+        "messages": [
+            {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 400,
+        "temperature": 0.9,
     }
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "content-type": "application/json"}
+    headers = {"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(url, json=payload, headers=headers) as response:
@@ -2942,18 +2943,17 @@ async def ask_ai(prompt: str) -> str | None:
                 print(f"Chat API error {response.status}: {(await response.text())[:300]}")
                 return None
             data = await response.json()
-    candidates = data.get("candidates") or []
-    if not candidates:
-        print(f"Chat API gave no answer: {str(data)[:300]}")    # for example blocked by Google's safety filter
+    choices = data.get("choices") or []
+    if not choices:
+        print(f"Chat API gave no answer: {str(data)[:300]}")
         return None
-    parts = (candidates[0].get("content") or {}).get("parts") or []
-    text = "".join(part.get("text", "") for part in parts if not part.get("thought")).strip()
+    text = ((choices[0].get("message") or {}).get("content") or "").strip()
     if not text:
         print(f"Chat API gave an empty answer: {str(data)[:300]}")
     return text or None
 
 async def bot_chat_reply(message: discord.Message):
-    if not GEMINI_API_KEY: return
+    if not AI_API_KEY: return
     if CHAT_CHANNEL_IDS and message.channel.id not in CHAT_CHANNEL_IDS: return
     now = time.time()
     if now - chat_last.get(message.author.id, 0) < CHAT_COOLDOWN: return
@@ -3038,12 +3038,12 @@ async def cat_reactions(message: discord.Message):
     # 1) Reply to the bot comes FIRST. A reply usually also pings the bot, so if the
     #    ping check came first, the bot would only meow and never reach the AI.
     if await is_reply_to_bot(message):
-        if GEMINI_API_KEY: await bot_chat_reply(message)
+        if AI_API_KEY: await bot_chat_reply(message)
         else: await send_meow(message)
     # 2) Pinged: with some text -> AI answer, a bare ping -> meow
     elif client.user in message.mentions:
         text = message.clean_content.replace(f"@{client.user.display_name}", "").strip()
-        if GEMINI_API_KEY and len(text) > 3: await bot_chat_reply(message)
+        if AI_API_KEY and len(text) > 3: await bot_chat_reply(message)
         else: await send_meow(message)
     # 3) Somebody meows: meow back
     elif message.channel.id != ART_CHANNEL_ID and looks_like_meow(message.content):

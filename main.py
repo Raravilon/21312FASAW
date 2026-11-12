@@ -37,7 +37,7 @@ ART_REMOVE_EMOJI = "\u274c"                         # the cross mark
 # GROQ_API_KEY (otherwise it meows).
 # Get a free key at https://console.groq.com/keys  (never write the key into the code, use the variable)
 AI_API_KEY = os.getenv("GROQ_API_KEY") or "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"
-AI_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+AI_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 CHAT_COOLDOWN = 8                 # seconds between two answers to the same person
 CHAT_HISTORY = 8                  # how many earlier messages the bot reads for context
 CHAT_MAX_REPLY = 1500             # characters
@@ -2932,7 +2932,9 @@ async def ask_ai(prompt: str) -> str | None:
             {"role": "system", "content": CHAT_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": 400,
+        # gpt-oss models "think" first and thinking uses up tokens, so keep the limit generous
+        "max_completion_tokens": 1500,
+        "reasoning_effort": "low",
         "temperature": 0.9,
     }
     headers = {"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}

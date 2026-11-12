@@ -33,9 +33,10 @@ ART_LIKE_EMOJIS = ("\u2764\ufe0f", "\u2764")      # the red heart (with and with
 ART_REMOVE_EMOJI = "\u274c"                         # the cross mark
 
 # Chat: pings and meows in chat get a random meow from the bot. When somebody replies to a bot message,
-# the bot answers with the AI chat if there is an Anthropic API key in ANTHROPIC_API_KEY (otherwise it meows).
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "claude-haiku-5-5")
+# the bot answers with the free Google Gemini AI if there is a key in GEMINI_API_KEY (otherwise it meows).
+# Get a free key at https://aistudio.google.com/apikey
+GEMINI_API_KEY = os.getenv("GEMINI_API_KE")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 CHAT_COOLDOWN = 8                 # seconds between two answers to the same person
 CHAT_HISTORY = 8                  # how many earlier messages the bot reads for context
 CHAT_MAX_REPLY = 1500             # characters
@@ -2916,22 +2917,32 @@ async def build_chat_prompt(message: discord.Message) -> str:
             f"New message for you:\n{asker}: {message.clean_content.strip()[:800]}\n\n"
             f"Write your reply to {asker}.")
 
-async def ask_claude(prompt: str) -> str | None:
-    payload = {"model": CHAT_MODEL, "max_tokens": 300, "system": CHAT_SYSTEM_PROMPT,
-               "messages": [{"role": "user", "content": prompt}]}
-    headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+async def ask_ai(prompt: str) -> str | None:
+    """Asks Google Gemini (free tier). Returns None if there is no answer."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    payload = {
+        "systemInstruction": {"parts": [{"text": CHAT_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 400, "temperature": 0.9},
+    }
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "content-type": "application/json"}
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers) as response:
+        async with session.post(url, json=payload, headers=headers) as response:
             if response.status != 200:
                 print(f"Chat API error {response.status}: {(await response.text())[:300]}")
                 return None
             data = await response.json()
-    text = "".join(block.get("text", "") for block in data.get("content", []) if block.get("type") == "text").strip()
+    candidates = data.get("candidates") or []
+    if not candidates:
+        print(f"Chat API gave no answer: {str(data)[:300]}")    # for example blocked by Google's safety filter
+        return None
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    text = "".join(part.get("text", "") for part in parts).strip()
     return text or None
 
 async def bot_chat_reply(message: discord.Message):
-    if not ANTHROPIC_API_KEY: return
+    if not GEMINI_API_KEY: return
     if CHAT_CHANNEL_IDS and message.channel.id not in CHAT_CHANNEL_IDS: return
     now = time.time()
     if now - chat_last.get(message.author.id, 0) < CHAT_COOLDOWN: return
@@ -2941,10 +2952,12 @@ async def bot_chat_reply(message: discord.Message):
     async with chat_slots:
         try:
             async with message.channel.typing():
-                answer = await ask_claude(await build_chat_prompt(message))
+                answer = await ask_ai(await build_chat_prompt(message))
         except (aiohttp.ClientError, asyncio.TimeoutError, discord.HTTPException) as error:
             print(f"Chat failed: {error!r}")
-    if not answer: return
+    if not answer:                      # no answer (limit reached, error...): just meow
+        await send_meow(message)
+        return
 
     answer = answer[:CHAT_MAX_REPLY]
     no_pings = discord.AllowedMentions.none()
@@ -3014,7 +3027,7 @@ async def cat_reactions(message: discord.Message):
     if client.user in message.mentions:                       # pinged: meow
         await send_meow(message)
     elif await is_reply_to_bot(message):                      # replied to the bot: AI chat, or a meow without a key
-        if ANTHROPIC_API_KEY: await bot_chat_reply(message)
+        if GEMINI_API_KEY: await bot_chat_reply(message)
         else: await send_meow(message)
     elif message.channel.id != ART_CHANNEL_ID and looks_like_meow(message.content):   # somebody meows
         await send_meow(message)

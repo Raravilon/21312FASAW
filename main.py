@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import random
 import re
@@ -7,6 +8,9 @@ import time
 import datetime
 from collections import deque
 from difflib import SequenceMatcher
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import aiohttp
 import discord
@@ -320,6 +324,11 @@ class Database:
             )
             """
         )
+        self.conn.execute("CREATE TABLE IF NOT EXISTS fish_caught (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, fish_key TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, best_kg REAL NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id, fish_key))")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS fish_items (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, item_key TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id, item_key))")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS fish_rods (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, rod_key TEXT NOT NULL, PRIMARY KEY (guild_id, user_id, rod_key))")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS fish_baits (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, bait_key TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id, bait_key))")
+
         self.conn.commit()
 
     def get_setting(self, key: str, default: str) -> str:
@@ -849,18 +858,29 @@ def level_role_set(guild: discord.Guild) -> set:
     return found
 
 def find_shop_role(guild: discord.Guild, name: str) -> discord.Role | None:
-    """Like find_role, but never returns a level-reward role (so the shop can't sell them)."""
-    excluded = level_role_set(guild)
-    candidates = [r for r in guild.roles if r not in excluded]
+    """Like find_role, but never returns a level-reward role (so the shop can't sell them).
+
+    FIX: exact (case-insensitive) matches win over fuzzy ones, so a shop
+    role called "Maplet" no longer resolves to the level role "Maplet...".
+    For prefix matches, prefer the SHORTEST candidate ("Maplet" over "Maplet...").
+    """
+    excluded_ids = {r.id for r in level_role_set(guild)}
+    candidates = [r for r in guild.roles if r.id not in excluded_ids]
     lowered = name.lower()
-    for role in candidates:
-        if role.name.lower() == lowered: return role
-    for role in candidates:
-        if role.name.lower().startswith(lowered): return role
+    # 1. exact match first (anywhere in the guild — exact name = the right role)
+    for role in guild.roles:
+        if role.name.lower() == lowered and role.id not in excluded_ids:
+            return role
+    # 2. normalized exact match
     wanted = _norm_role(name)
     if wanted:
         for role in candidates:
-            if _norm_role(role.name) == wanted: return role
+            if _norm_role(role.name) == wanted:
+                return role
+    # 3. prefix match — shortest name first so "Maplet" beats "Maplet..."
+    prefixed = [r for r in candidates if r.name.lower().startswith(lowered)]
+    if prefixed:
+        return min(prefixed, key=lambda r: len(r.name))
     return None
 
 async def get_role(guild: discord.Guild, name: str) -> discord.Role | None:
@@ -983,16 +1003,90 @@ SHOP_CATEGORIES = {
         "items": [
             {"key": "wyphlet", "name": "Wyphlet", "emoji": "Wyphlet", "role": "Wyphlet", "description": "WAIT... A REAL WYP-", "mups": 500, "vups": 500},
         ],
-    }
+    },
+    "plushie": {
+        "label": "Plushie Collection",
+        "flag": "NEW",
+        "items": [
+            {"key": "niko_crying", "name": "Niko crying", "emoji": "Niko_crying", "role": "Niko crying", "description": "shhh... it's okay :(", "mups": 666, "vups": 10},
+            {"key": "niko_uh", "name": "Niko uh...", "emoji": "Niko_uh", "role": "Niko uh...", "description": "uh... hi?", "mups": 444, "vups": 0},
+            {"key": "teto_plush", "name": "Teto Plush", "emoji": "Teto_Plush", "role": "Teto Plush", "description": "Teto!!", "mups": 989, "vups": 0},
+            {"key": "guitar_miku", "name": "Guitar Miku", "emoji": "Guitar_Miku", "role": "Guitar Miku", "description": "Rock on!", "mups": 1400, "vups": 0},
+            {"key": "blue_plushie", "name": "BLUE PLUSHIE", "emoji": "BLUE_PLUSHIE", "role": "BLUE PLUSHIE", "description": "So blue, so soft!", "mups": 200, "vups": 0},
+            {"key": "black_plushie", "name": "BLACK PLUSHIE", "emoji": "BLACK_PLUSHIE", "role": "BLACK PLUSHIE", "description": "So dark, so soft!", "mups": 199, "vups": 0},
+        ],
+    },
+
 }
 
 def get_active_shop_categories():
     active = {}
+    try:
+        daily = daily_shop_items()
+    except Exception:
+        daily = []
+    if daily:
+        active["daily"] = {"label": "Daily Shop", "flag": "3 items, refresh 00:00 UTC", "items": daily}
     now = time.time()
     for key, data in SHOP_CATEGORIES.items():
         if "expiry" in data and now > data["expiry"]: continue
-        active[key] = data
+        active[key] = {"label": data["label"], "flag": data.get("flag", ""), "items": list(data["items"])}
+    try:
+        raw = db.get_setting("custom_shop_items", "[]")
+        custom = json.loads(raw) if raw else []
+    except (ValueError, TypeError):
+        custom = []
+    if custom:
+        other = active.setdefault("other", {"label": "Other", "flag": "", "items": []})
+        seen = {item.get("key") for cat in active.values() for item in cat["items"]}
+        for item in custom:
+            if isinstance(item, dict) and item.get("key") and item.get("key") not in seen:
+                seen.add(item["key"])
+                other["items"].append(item)
     return active
+def daily_shop_items() -> list[dict]:
+    import json as _j
+    pool = [it for cat in SHOP_CATEGORIES.values() for it in cat["items"]]
+    try: pool += _j.loads(db.get_setting("custom_shop_items", "[]"))
+    except Exception: pass
+    if not pool: return []
+    day = int(time.time() // 86400)
+    r = random.Random(777 + day)
+    cheap = [i for i in pool if i.get("mups", 0) <= 50 and i.get("vups", 0) == 0] or pool
+    picks = [r.choice(cheap)]
+    rest = [i for i in pool if i.get("key") != picks[0].get("key")]
+    w = [1 / (1 + i.get("mups", 1) / 200 + i.get("vups", 0)) for i in rest]
+    while len(picks) < 3 and rest:
+        tot = sum(w)
+        x = r.random() * tot
+        for i, ww in zip(list(rest), list(w)):
+            x -= ww
+            if x <= 0:
+                picks.append(i)
+                j = rest.index(i); rest.pop(j); w.pop(j)
+                break
+    return picks
+
+
+def get_custom_shop_items() -> list[dict]:
+    try:
+        raw = db.get_setting("custom_shop_items", "[]")
+        items = json.loads(raw) if raw else []
+    except (ValueError, TypeError):
+        return []
+    return [i for i in items if isinstance(i, dict) and i.get("key")]
+
+
+def save_custom_shop_items(items: list[dict]):
+    db.set_setting("custom_shop_items", json.dumps(items))
+
+
+def find_shop_item(key: str) -> dict | None:
+    for cat in get_active_shop_categories().values():
+        for item in cat["items"]:
+            if item.get("key") == key:
+                return item
+    return None
 
 
 # ======================================================================
@@ -2456,8 +2550,14 @@ class ShopBuyButton(discord.ui.Button):
         member = interaction.user
         role = find_shop_role(guild, item["role"])
         if role is None:
-            await interaction.response.send_message("I can't find that role right now. Please tell a mod.", ephemeral=True)
-            return
+            # The role doesn't exist on the server yet: create it automatically
+            try:
+                role = await guild.create_role(name=item["role"], reason=f"Shop item created: {item['name']}")
+            except (discord.Forbidden, discord.HTTPException):
+                role = None
+            if role is None:
+                await interaction.response.send_message("I can't find that role right now. Please tell a mod.", ephemeral=True)
+                return
         if role in member.roles:
             await interaction.response.send_message("You already own this one.", ephemeral=True)
             return
@@ -2550,6 +2650,90 @@ class ShopView(discord.ui.View):
 async def shop(interaction: discord.Interaction):
     view = ShopView(interaction.user)
     await interaction.response.send_message(embed=view.make_embed(), view=view)
+
+
+@client.tree.command(name="shop_add", description="Add a new role to the shop (admins only)")
+@app_commands.describe(
+    name="Item name shown in the shop",
+    role="Exact role name on the server (will be created if missing)",
+    mups="Price in Mups",
+    vups="Price in Vups",
+    description="Short description shown in the shop",
+    emoji="Server emoji name for the icon (optional)",
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def shop_add(
+    interaction: discord.Interaction,
+    name: str,
+    role: str,
+    mups: app_commands.Range[int, 0, 1000000],
+    vups: app_commands.Range[int, 0, 1000000] = 0,
+    description: str = "A shiny new role!",
+    emoji: str | None = None,
+):
+    if not is_server_admin(interaction):
+        await interaction.response.send_message("Only the server creator or admins can do this.", ephemeral=True)
+        return
+    name, role = name.strip(), role.strip()
+    if not name or not role:
+        await interaction.response.send_message("Name and role can't be empty.", ephemeral=True)
+        return
+    key = "custom_" + re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    if not key or key == "custom_":
+        await interaction.response.send_message("Give it a name with normal letters.", ephemeral=True)
+        return
+    if find_shop_item(key):
+        await interaction.response.send_message(f"An item with key `{key}` already exists. Pick another name.", ephemeral=True)
+        return
+    # role must not clash with a level-reward role
+    guild = interaction.guild
+    for req_level, lvl_name in LEVEL_ROLES:
+        lvl_role = find_role(guild, lvl_name)
+        if lvl_role and _norm_role(role) == _norm_role(lvl_role.name):
+            await interaction.response.send_message(
+                f"That name is too close to the level-{req_level} role **{lvl_role.name}**. Pick another name.",
+                ephemeral=True,
+            )
+            return
+    items = get_custom_shop_items()
+    items.append({
+        "key": key, "name": name[:50], "emoji": (emoji or "")[:50],
+        "role": role[:50], "description": description[:200],
+        "mups": int(mups), "vups": int(vups),
+    })
+    save_custom_shop_items(items)
+    await interaction.response.send_message(
+        f"Added **{name}** to the shop (role **{role}**, {mups} Mups | {vups} Vups). It appears in Other right away — no restart needed!",
+        ephemeral=True,
+    )
+
+
+@client.tree.command(name="shop_remove", description="Remove a custom shop item (admins only)")
+@app_commands.describe(item="Which custom item to remove")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def shop_remove(interaction: discord.Interaction, item: str):
+    if not is_server_admin(interaction):
+        await interaction.response.send_message("Only the server creator or admins can do this.", ephemeral=True)
+        return
+    items = get_custom_shop_items()
+    kept = [i for i in items if i.get("key") != item]
+    if len(kept) == len(items):
+        await interaction.response.send_message("No custom item with that key. Only items added via /shop_add can be removed.", ephemeral=True)
+        return
+    save_custom_shop_items(kept)
+    await interaction.response.send_message("Removed from the shop!", ephemeral=True)
+
+
+@shop_remove.autocomplete("item")
+async def shop_remove_autocomplete(interaction: discord.Interaction, current: str):
+    choices = [
+        app_commands.Choice(name=f"{i.get('name')} ({i.get('key')})", value=i.get("key"))
+        for i in get_custom_shop_items()
+        if current.lower() in str(i.get("name", "")).lower() or current.lower() in i.get("key", "")
+    ]
+    return choices[:25]
 
 
 # ======================================================================
@@ -3401,6 +3585,651 @@ async def remove_application(interaction: discord.Interaction, application: str)
     await interaction.response.send_message(f"**{name}** is now hidden from the applications message.", ephemeral=True)
 
 
+# ================= FISHINGpt1: data =================
+FISH_CHANNEL_ID = int(os.getenv("FISH_CHANNEL_ID", "1575154751723671682"))
+TRADE_MIN_LEVEL = 15
+# rarity: (weight, label, emoji)
+FISH_RARITY = {"common": (50, "Common", "🐟"), "uncommon": (28, "Uncommon", "🐠"), "rare": (14, "Rare", "💙"), "epic": (6, "Epic", "💜"), "legendary": (2, "Legendary", "🌟")}
+# key, name, rarity, max_kg, price, desc, night_only, weather, need_bait
+FISH_SPECIES = [
+("bubble_guppy", "Bubble Guppy", "common", 0.5, 3, "Tiny and always surprised.", 0, "", ""),
+("mud_minnow", "Mud Minnow", "common", 1.0, 4, "Lives in mud, proud of it.", 0, "", ""),
+("sockfish", "Sockfish", "common", 0.8, 5, "Smells suspicious.", 0, "", ""),
+("pebble_pup", "Pebble Pup", "common", 2.0, 6, "Basically a rock with fins.", 0, "", ""),
+("puddle_perch", "Puddle Perch", "common", 1.5, 5, "Found in the smallest puddles.", 0, "", ""),
+("grumbletad", "Grumbletad", "common", 0.6, 4, "Grumbling since birth.", 0, "", ""),
+("noodlefish", "Noodlefish", "common", 1.2, 6, "Wiggly like a noodle.", 0, "", ""),
+("dust_darter", "Dust Darter", "common", 0.9, 5, "Kicks up dust everywhere.", 0, "", ""),
+("button_bass", "Button Bass", "common", 2.5, 8, "Round and shiny like a button.", 0, "", ""),
+("squeakfin", "Squeakfin", "common", 0.7, 5, "Squeaks when you hold it.", 0, "", ""),
+("striped_biter", "Striped Biter", "uncommon", 4.0, 15, "Bites first, asks later.", 0, "", ""),
+("lantern_sardine", "Lantern Sardine", "uncommon", 3.0, 14, "Glows when embarrassed.", 0, "", ""),
+("corn_cobbler", "Corn Cobbler", "uncommon", 5.0, 18, "Loves corn bait.", 0, "", ""),
+("zippy_zander", "Zippy Zander", "uncommon", 6.0, 20, "Too fast for its own good.", 0, "", ""),
+("mossy_mullet", "Mossy Mullet", "uncommon", 5.5, 19, "Covered in cozy moss.", 0, "", ""),
+("pocket_pike", "Pocket Pike", "uncommon", 4.5, 17, "Fits in your pocket. Barely.", 0, "", ""),
+("giggle_goby", "Giggle Goby", "uncommon", 2.0, 13, "Laughs at its own jokes.", 0, "", ""),
+("copper_carp", "Copper Carp", "uncommon", 7.0, 22, "Shiny like a penny.", 0, "", ""),
+("fern_fang", "Fern Fang", "uncommon", 5.0, 18, "Hides in the ferns.", 0, "", ""),
+("dusk_dace", "Dusk Dace", "uncommon", 3.5, 16, "Only shows at sundown.", 0, "", ""),
+("paint_koi", "Paint Koi", "rare", 12.0, 45, "Each scale a different color.", 0, "", ""),
+("thunder_eel", "Thunder Eel", "rare", 20.0, 60, "Buzzes near thunder bait.", 0, "rain", ""),
+("moonlight_eel", "Moonlight Eel", "rare", 25.0, 70, "Only comes out at night.", 1, "", ""),
+("prism_perch", "Prism Perch", "rare", 10.0, 40, "Splits light into rainbows.", 0, "", ""),
+("velvet_loach", "Velvet Loach", "rare", 8.0, 38, "Soft like velvet.", 0, "", ""),
+("clockwork_cod", "Clockwork Cod", "rare", 15.0, 55, "Ticks instead of swimming.", 0, "", ""),
+("paperfish", "Paperfish", "rare", 2.0, 42, "Folds itself into shapes.", 0, "", ""),
+("ember_angler", "Ember Angler", "rare", 18.0, 65, "Its lure never goes out.", 0, "", ""),
+("frostfin", "Frostfin", "rare", 14.0, 58, "Cold to the touch.", 0, "", ""),
+("echo_bass", "Echo Bass", "rare", 22.0, 62, "You hear it twice.", 0, "", ""),
+("meme_shark", "Meme Shark", "epic", 400.0, 300, "Knows all your secrets.", 0, "", ""),
+("golden_koi", "Golden Koi", "epic", 150.0, 280, "Worth a fortune.", 0, "", ""),
+("storm_ray", "Storm Ray", "epic", 600.0, 350, "Rides the lightning.", 0, "storm", ""),
+("sleepy_starfish", "Sleepy Starfish", "epic", 50.0, 250, "Yawns all day. Night only.", 1, "", ""),
+("crystal_crab", "Crystal Crab", "epic", 80.0, 260, "Claws made of glass.", 0, "", ""),
+("opal_octopus", "Opal Octopus", "epic", 120.0, 320, "Changes color with mood.", 0, "", ""),
+("void_eel", "Void Eel", "epic", 200.0, 380, "Stares back into the abyss.", 0, "", "starlight_dust"),
+("starlight_tuna", "Starlight Tuna", "epic", 180.0, 360, "Needs starlight bait.", 0, "", "starlight_dust"),
+("cosmic_jelly", "Cosmic Jelly", "epic", 60.0, 340, "Full of tiny galaxies.", 0, "", "starlight_dust"),
+("cachalot", "Cachalot", "legendary", 9000.0, 2500, "The white whale. Needs kraken bait.", 0, "", "kraken_tentacle"),
+("kraken", "Kraken", "legendary", 17350.0, 5000, "The deep itself has arms.", 0, "", "kraken_tentacle"),
+("abyss_king", "Abyss King", "legendary", 5000.0, 3000, "Wears a crown of teeth.", 0, "", ""),
+("moby_bloom", "Moby Bloom", "legendary", 7000.0, 3200, "A whale that blooms.", 0, "", ""),
+("sunken_crownfish", "Sunken Crownfish", "legendary", 3000.0, 2800, "Lost crown of the sea.", 0, "", ""),
+("leviathan_pup", "Leviathan Pup", "legendary", 4000.0, 2900, "Just a baby. A huge baby.", 0, "", ""),
+("tide_god", "Tide God", "legendary", 11000.0, 6000, "It decides where water goes.", 0, "", ""),
+("wobblefish", "Wobblefish", "common", 1.1, 5, "Wobbles everywhere.", 0, "", ""),
+("tadpole_tom", "Tadpole Tom", "common", 0.4, 3, "Just a tadpole.", 0, "", ""),
+("slippy", "Slippy Slimefish", "common", 0.9, 5, "Too slippery.", 0, "", ""),
+("crumb_carp", "Crumb Carp", "common", 2.2, 7, "Eats leftovers.", 0, "", ""),
+("blinkfish", "Blinkfish", "common", 0.5, 4, "Blinks a lot.", 0, "", ""),
+("snicker_eel", "Snicker Eel", "uncommon", 4.2, 16, "Snickers softly.", 0, "", ""),
+("marble_minnow", "Marble Minnow", "uncommon", 3.2, 15, "Swirly colors.", 0, "", ""),
+("puff_pout", "Puff Pout", "uncommon", 5.2, 18, "Pouts when hungry.", 0, "", ""),
+("twirl_trout", "Twirl Trout", "uncommon", 6.5, 21, "Spins in circles.", 0, "", ""),
+("glow_guppy", "Glow Guppy", "uncommon", 2.5, 14, "Glows a little.", 0, "", ""),
+("mist_mackerel", "Mist Mackerel", "rare", 11.0, 44, "Hides in mist.", 0, "fog", ""),
+("dream_dory", "Dream Dory", "rare", 9.0, 41, "Sleepy swimmer.", 1, "", ""),
+("rosefin", "Rosefin", "rare", 13.0, 50, "Smells like roses.", 0, "", ""),
+("static_stingray", "Static Stingray", "rare", 17.0, 60, "Sparks fly.", 0, "storm", ""),
+("comet_chub", "Comet Chub", "rare", 16.0, 56, "Leaves a trail.", 0, "", ""),
+("kraken_baby", "Kraken Baby", "epic", 300.0, 400, "Small but grabby.", 0, "", "kraken_tentacle"),
+("moon_jelly", "Moon Jelly", "epic", 40.0, 240, "Night glow.", 1, "", ""),
+("phoenix_fish", "Phoenix Fish", "epic", 90.0, 300, "Reborn in fire.", 0, "", ""),
+("opalfin_tuna", "Opalfin Tuna", "epic", 200.0, 370, "Shiny giant.", 0, "", ""),
+("voidwhale", "Voidwhale", "epic", 500.0, 450, "Swims through nothing.", 0, "", "starlight_dust"),
+("star_eater", "Star Eater", "legendary", 6000.0, 3500, "Eats stars.", 0, "", "starlight_dust"),
+("dreadmaw", "Dreadmaw", "legendary", 8000.0, 4000, "Fear itself.", 0, "", ""),
+("neptune", "Neptune's Heir", "legendary", 9500.0, 5500, "Royal blood.", 0, "", ""),
+("ghost_whale", "Ghost Whale", "legendary", 7500.0, 4200, "Haunts ships.", 1, "", ""),
+("world_serpent", "World Serpent", "legendary", 15000.0, 8000, "Wraps the ocean.", 0, "", ""),
+]
+FISH_BY_KEY = {f[0]: f for f in FISH_SPECIES}
+# key, name, maxkg, price, res, luck, lure, special
+FISH_RODS = [
+("stick", "Stick Rod", 5, 5, 0, 0, 0, ""),
+("bamboo", "Bamboo Rod", 45, 180, 4, 10, 0, ""),
+("carbon", "Carbon Rod", 1200, 475, 5, 0, 5, ""),
+("clover", "Lucky Clover Rod", 800, 825, 2, 35, 10, ""),
+("magnet", "Magnet Rod", 1500, 1250, -5, 45, 15, "item65"),
+("fortune", "Fortune Rod", 1900, 1850, 5, 100, 35, ""),
+("tidebreaker", "Tidebreaker Rod", 5700, 3450, 20, 65, 20, "item65"),
+("stormchaser", "Stormchaser Rod", 7200, 4700, 15, 80, 30, ""),
+("moonlight", "Moonlight Rod", 8200, 7000, 10, 75, 15, "night35"),
+("tornado", "Tornado Rod", 6500, 11450, -20, -20, 70, "instant15"),
+("tidal", "Tidal Rod", 11000, 16500, 15, 170, 85, ""),
+("abyssal", "Abyssal Rod", 17350, 24200, 35, 125, 5, "abyssal25"),
+]
+ROD_BY_KEY = {r[0]: r for r in FISH_RODS}
+# key, name, price(0=unbuyable/-1=catch only), lure, luck, res, kg, uses, special
+FISH_BAITS = [
+("seaweed", "Seaweed", -1, -5, 2, 2, 0.06, 10, ""),
+("bread", "Bread Crumbs", 3, 4, -10, 0, 0.01, 10, ""),
+("loaf", "Loaf Crackers", 15, 2, -5, 3, 0.02, 10, ""),
+("worm", "Default Worm", 40, 5, 2, 2, 0.01, 10, ""),
+("corn", "Corn Kernel", 35, 10, 0, 5, 0.4, 10, ""),
+("beetle", "Beetle", 25, 2, 1, 2, 0.01, 10, ""),
+("sugar", "Sugar Cube", 50, 14, 6, -4, 0.03, 10, ""),
+("shrimp", "Shrimp", 125, 8, 15, 1, 0.04, 10, ""),
+("thunder", "Thunder Beetle", 200, 15, 20, 10, 0.01, 10, ""),
+("magnetb", "Magnet", 750, 70, -90, 40, 2.0, 10, ""),
+("frog", "Frog", -1, 15, 25, 10, 0.5, 5, ""),
+("goo", "Radioactive Goo", 925, 60, 55, 5, 0.2, 10, "radioactive"),
+("starlight_dust", "Starlight Dust", 2150, 85, 70, 0, 0.05, 5, "starlight"),
+("kraken_tentacle", "Kraken Tentacle Bit", 6000, 20, 210, 30, 15.0, 5, "cachalot"),
+]
+BAIT_BY_KEY = {b[0]: b for b in FISH_BAITS}
+# key, name, kind(trash/item/chest), price, kg
+FISH_ITEMS = [
+("seaweed_i", "Seaweed", "trash", 2, 0.001),
+("old_boot", "Old Boot", "trash", 5, 0.01),
+("rusty_can", "Rusty Tin Can", "trash", 8, 0.01),
+("bottle", "Message in a Bottle", "trash", 35, 0.05),
+("chair", "Chair", "item", 25, 1.0),
+("pan", "Pan", "item", 15, 0.1),
+("wheel", "Wheel", "item", 60, 16.0),
+("big_wheel", "Big Wheel", "item", 170, 45.0),
+("wooden_crate", "Wooden Crate", "chest", 85, 60.0),
+("bait_box", "Bait Box", "chest", 125, 4.0),
+("treasure_chest", "Treasure Chest", "chest", 600, 150.0),
+("sea_chest", "Sea Treasure Chest", "chest", 950, 235.0),
+("golden_chest", "Golden Treasure Chest", "chest", 1600, 500.0),
+]
+ITEM_BY_KEY = {x[0]: x for x in FISH_ITEMS}
+# ================= FISHINGpt3: engine =================
+def fish_weather(now=None):
+    h = int((now or time.time()) // 3600)
+    r = random.Random(h // 1)
+    roll = r.random() * 100
+    if roll < 55: return "clear"
+    if roll < 75: return "rain"
+    if roll < 88: return "fog"
+    return "storm"
+WEATHER_EMOJI = {"clear": "☀️", "rain": "🌧️", "fog": "🌫️", "storm": "⛈️"}
+def is_night():
+    h = (datetime.datetime.now(datetime.timezone.utc).hour + NIGHT_UTC_OFFSET) % 24
+    return h >= 22 or h < 6
+def fish_equipped(gid, uid):
+    rod = db.get_flag(gid, uid, "fish_rod") or "stick"
+    bk = db.get_flag(gid, uid, "fish_bait") or ""
+    try: rod = FISH_RODS[int(rod)][0]
+    except (ValueError, IndexError): pass
+    if isinstance(rod, float) and rod.is_integer(): rod = FISH_RODS[int(rod)][0]
+    return (rod if rod in ROD_BY_KEY else "stick", bk if bk in BAIT_BY_KEY else "")
+def fish_stats_total(gid, uid):
+    row = db.conn.execute("SELECT COALESCE(SUM(count),0),COALESCE(MAX(best_kg),0) FROM fish_caught WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
+    return row[0], row[1]
+def fish_rarest(gid, uid):
+    order = {"common": 0, "uncommon": 1, "rare": 2, "epic": 3, "legendary": 4}
+    rows = db.conn.execute("SELECT fish_key,count FROM fish_caught WHERE guild_id=? AND user_id=? AND count>0", (gid, uid)).fetchall()
+    best, bs = None, -1
+    for k, _ in rows:
+        f = FISH_BY_KEY.get(k)
+        if f and order[f[2]] > bs: best, bs = f[1], order[f[2]]
+    return best or "—"
+def fish_roll(gid, uid):
+    rod_key, bait_key = fish_equipped(gid, uid)
+    rod = ROD_BY_KEY[rod_key]
+    _, _, rmax, _, res, luck, lure, spec = rod
+    blure, bluck, bres, bspec = 0, 0, 0, ""
+    if bait_key:
+        b = BAIT_BY_KEY[bait_key]
+        blure, bluck, bres, bspec = b[3], b[4], b[5], b[8]
+    w = fish_weather()
+    luck_tot = luck + bluck + (35 if spec == "night35" and is_night() else 0)
+    if w == "rain": luck_tot += 15
+    if w == "storm": luck_tot += 30
+    pool = []
+    for f in FISH_SPECIES:
+        key, name, rar, mx, price, desc, night, fw, need = f
+        if night and not is_night(): continue
+        if fw and fw != w and not (fw == "rain" and w == "storm"): continue
+        if need and bait_key != need: continue
+        if mx > rmax: continue
+        base = FISH_RARITY[rar][0]
+        mult = max(0.05, 1 + luck_tot / 100)
+        ww = base * mult if rar in ("rare", "epic", "legendary") else base
+        if rar == "common": ww = base * max(0.3, 1 - luck_tot / 300)
+        pool.append((f, ww))
+    if not pool: pool = [(FISH_BY_KEY["bubble_guppy"], 1)]
+    tot = sum(p[1] for p in pool)
+    x = random.random() * tot
+    chosen = pool[0][0]
+    for f, ww in pool:
+        x -= ww
+        if x <= 0:
+            chosen = f
+            break
+    key, name, rar, mx, price, desc, night, fw, need = chosen
+    lo = max(0.01, mx * 0.15)
+    kg = round(random.uniform(lo, mx), 2)
+    if kg > rmax: kg = rmax
+    shiny = random.random() < 0.01
+    mut = ""
+    if spec == "abyssal25" and random.random() < 0.25: mut = "Abyssal"
+    elif bspec == "radioactive" and random.random() < 0.25: mut = "Radioactive"
+    if mut: price = int(price * 3)
+    if shiny: price = int(price * 10)
+    item_drop = None
+    if "item65" in spec and random.random() < 0.65:
+        item_drop = random.choice(["wooden_crate", "bait_box", "old_boot", "rusty_can", "bottle", "chair", "pan", "wheel"])
+    instant = "instant15" in spec and random.random() < 0.15
+    trash_drop = None
+    if random.random() < 0.05 and not instant:
+        trash_drop = random.choice(["seaweed_i", "old_boot", "rusty_can", "bottle"])
+    return {"fish": chosen, "kg": kg, "shiny": shiny, "mut": mut, "item": item_drop, "trash": trash_drop, "instant": instant, "res": res + bres, "lure": lure + blure, "rod": rod, "bait": bait_key, "weather": w, "price": price}
+# ================= FISHINGpt4: QTE view =================
+class QTEView(discord.ui.View):
+    def __init__(self, member, roll):
+        super().__init__(timeout=30)
+        self.member = member; self.roll = roll
+        self.pos = 0; self.dir = 1; self.done = False; self.msg = None
+        rar = roll["fish"][2]
+        self.zone = {"common": 3, "uncommon": 3, "rare": 2, "epic": 2, "legendary": 1}[rar]
+        self.zstart = 2
+        base = {"common": 1.4, "uncommon": 1.2, "rare": 1.0, "epic": 0.8, "legendary": 0.65}[rar]
+        self.tick = max(0.3, base * (1 - min(50, max(-50, roll["res"])) / 100))
+        self.task = None
+    def bar(self):
+        cells = []
+        for i in range(7):
+            if self.zstart <= i < self.zstart + self.zone: cells.append("🟩" if i == self.pos else "🟨")
+            else: cells.append("🟦" if i != self.pos else "🟥")
+        return "".join(cells)
+    def make_embed(self):
+        f = self.roll["fish"]
+        e = discord.Embed(title="🎣 Something bites!", description=f"{self.bar()}\nPress **HOOK!** when the red square is on green!\nWEATHER_EMOJI_PLACEHOLDER", colour=CREAM)
+        e.description = e.description.replace("WEATHER_EMOJI_PLACEHOLDER", f"{WEATHER_EMOJI[self.roll['weather']]} {self.roll['weather'].title()}")
+        return e
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.member.id:
+            await interaction.response.send_message("Not your rod!", ephemeral=True)
+            return False
+        return True
+    async def on_timeout(self):
+        if not self.done:
+            self.done = True
+            if self.task: self.task.cancel()
+            try: await self.msg.edit(content="It slipped away...", embed=None, view=None)
+            except Exception: pass
+    @discord.ui.button(label="HOOK!", style=discord.ButtonStyle.success)
+    async def hook(self, interaction, button):
+        if self.done: return
+        self.done = True
+        if self.task: self.task.cancel()
+        hit = self.zstart <= self.pos < self.zstart + self.zone
+        await finish_catch(interaction, self.member, self.roll, hit, self.msg)
+async def qte_loop(view):
+    try:
+        while not view.done:
+            await asyncio.sleep(view.tick)
+            view.pos += view.dir
+            if view.pos >= 6: view.pos = 6; view.dir = -1
+            if view.pos <= 0: view.pos = 0; view.dir = 1
+            try: await view.msg.edit(embed=view.make_embed(), view=view)
+            except Exception: break
+    except asyncio.CancelledError: pass
+async def finish_catch(interaction, member, roll, hit, qte_msg):
+    gid = interaction.guild.id
+    f = roll["fish"]
+    key, name, rar, mx, price, desc, night, fw, need = f
+    rmoji = FISH_RARITY[rar][2]
+    if roll["bait"]: db.bait_use(gid, member.id, roll["bait"])
+    if not hit:
+        try: await qte_msg.edit(content=f"{member.mention} missed! It slipped away...", embed=None, view=None)
+        except Exception: pass
+        try: await interaction.response.send_message("Missed!", ephemeral=True)
+        except Exception: pass
+        return
+    up = roll["instant"]
+    sell = roll.get("price", price)
+    db.fish_add(gid, member.id, key, roll["kg"])
+    if roll["item"]: db.fitem_add(gid, member.id, roll["item"])
+    if roll.get("trash"): db.fitem_add(gid, member.id, roll["trash"])
+    label = f"**{name}**"
+    if roll["shiny"]: label = f"✨ **SHINY {name}** ✨"
+    if roll["mut"]: label += f" [{roll['mut']}]"
+    txt = f"{member.mention} caught {rmoji} {label} — {roll['kg']} kg! ({sell} Mups)"
+    if roll["item"]: txt += f"\nBonus find: **{ITEM_BY_KEY[roll['item']][1]}**!"
+    if roll.get("trash"): txt += f"\nEw: **{ITEM_BY_KEY[roll['trash']][1]}**..."
+    e = discord.Embed(title="🎣 Caught!", description=txt, colour=PINK)
+    try: await qte_msg.edit(content=None, embed=e, view=None)
+    except Exception:
+        try: await interaction.channel.send(embed=e)
+        except Exception: pass
+    try:
+        if not interaction.response.is_done(): await interaction.response.send_message("Nice catch!", ephemeral=True)
+    except Exception: pass
+# ================= FISHINGpt5: fish commands =================
+fish_cd: dict[tuple[int, int], float] = {}
+@client.tree.command(name="fish", description="Cast your rod! (fishing channel only)")
+@app_commands.guild_only()
+async def fish(interaction: discord.Interaction):
+    if interaction.channel.id != FISH_CHANNEL_ID:
+        await interaction.response.send_message(f"You can only fish in <#{FISH_CHANNEL_ID}>!", ephemeral=True)
+        return
+    gid, uid = interaction.guild.id, interaction.user.id
+    now = time.time()
+    if now - fish_cd.get((gid, uid), 0) < 5:
+        await interaction.response.send_message("Wait a sec, reel in first...", ephemeral=True)
+        return
+    fish_cd[(gid, uid)] = now
+    rod_key, bait_key = fish_equipped(gid, uid)
+    if rod_key not in db.rod_list(gid, uid) and rod_key != "stick":
+        db.set_flag(gid, uid, "fish_rod", 0)
+        rod_key = "stick"
+    if bait_key:
+        has = dict(db.bait_bag(gid, uid)).get(bait_key, 0)
+        if not has:
+            db.set_flag(gid, uid, "fish_bait", "")
+            bait_key = ""
+    roll = fish_roll(gid, uid)
+    if roll["instant"]:
+        f = roll["fish"]
+        db.fish_add(gid, uid, f[0], roll["kg"])
+        if roll["bait"]: db.bait_use(gid, uid, roll["bait"])
+        e = discord.Embed(title="🎣 INSTANT CATCH!", description=f"{interaction.user.mention} caught {FISH_RARITY[f[2]][2]} **{f[1]}** — {roll['kg']} kg! (Tornado luck!)", colour=PINK)
+        await interaction.response.send_message(embed=e)
+        return
+    view = QTEView(interaction.user, roll)
+    await interaction.response.send_message(embed=view.make_embed(), view=view)
+    try: view.msg = await interaction.original_response()
+    except Exception: return
+    view.task = asyncio.create_task(qte_loop(view))
+@client.tree.command(name="weather", description="Check fishing weather")
+@app_commands.guild_only()
+async def weather(interaction: discord.Interaction):
+    w = fish_weather()
+    await interaction.response.send_message(f"{WEATHER_EMOJI[w]} Current weather: **{w.title()}**" + (" — rare fish bite better!" if w in ("rain", "storm") else ""))
+def fish_db_init():
+    for q in ("CREATE TABLE IF NOT EXISTS fish_caught (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, fish_key TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, best_kg REAL NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id, fish_key))",):
+        db.conn.execute(q)
+    db.conn.commit()
+def fish_db_init2():
+    db.conn.execute("CREATE TABLE IF NOT EXISTS fish_items (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, item_key TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id, item_key))")
+FISH_SPECIES += [
+("wobblefish", "Wobblefish", "common", 1.1, 5, "Wobbles everywhere.", 0, "", ""),
+("tadpole_tom", "Tadpole Tom", "common", 0.4, 3, "Just a tadpole.", 0, "", ""),
+("slippy", "Slippy Slimefish", "common", 0.9, 5, "Too slippery.", 0, "", ""),
+("crumb_carp", "Crumb Carp", "common", 2.2, 7, "Eats leftovers.", 0, "", ""),
+("blinkfish", "Blinkfish", "common", 0.5, 4, "Blinks a lot.", 0, "", ""),
+("snicker_eel", "Snicker Eel", "uncommon", 4.2, 16, "Snickers softly.", 0, "", ""),
+("marble_minnow", "Marble Minnow", "uncommon", 3.2, 15, "Swirly colors.", 0, "", ""),
+("puff_pout", "Puff Pout", "uncommon", 5.2, 18, "Pouts when hungry.", 0, "", ""),
+("twirl_trout", "Twirl Trout", "uncommon", 6.5, 21, "Spins in circles.", 0, "", ""),
+("glow_guppy", "Glow Guppy", "uncommon", 2.5, 14, "Glows a little.", 0, "", ""),
+("mist_mackerel", "Mist Mackerel", "rare", 11.0, 44, "Hides in mist.", 0, "fog", ""),
+("dream_dory", "Dream Dory", "rare", 9.0, 41, "Sleepy swimmer.", 1, "", ""),
+("rosefin", "Rosefin", "rare", 13.0, 50, "Smells like roses.", 0, "", ""),
+("static_stingray", "Static Stingray", "rare", 17.0, 60, "Sparks fly.", 0, "storm", ""),
+("comet_chub", "Comet Chub", "rare", 16.0, 56, "Leaves a trail.", 0, "", ""),
+("kraken_baby", "Kraken Baby", "epic", 300.0, 400, "Small but grabby.", 0, "", "kraken_tentacle"),
+("voidfin", "Voidfin", "epic", 150.0, 330, "Dark waters.", 0, "", "starlight_dust"),
+("moon_jelly", "Moon Jelly", "epic", 40.0, 240, "Night glow.", 1, "", ""),
+("phoenix_fish", "Phoenix Fish", "epic", 90.0, 300, "Reborn in fire.", 0, "", ""),
+("opalfin_tuna", "Opalfin Tuna", "epic", 200.0, 370, "Shiny giant.", 0, "", ""),
+("star_eater", "Star Eater", "legendary", 6000.0, 3500, "Eats stars.", 0, "", "starlight_dust"),
+("dreadmaw", "Dreadmaw", "legendary", 8000.0, 4000, "Fear itself.", 0, "", ""),
+("neptune", "Neptune's Heir", "legendary", 9500.0, 5500, "Royal blood.", 0, "", ""),
+("ghost_whale", "Ghost Whale", "legendary", 7500.0, 4200, "Haunts ships.", 1, "", ""),
+("world_serpent", "World Serpent", "legendary", 15000.0, 8000, "Wraps the ocean.", 0, "", ""),
+]
+FISH_BY_KEY = {f[0]: f for f in FISH_SPECIES}
+
+    db.conn.commit()
+fish_db_init2()
+def _fish_add(gid, uid, key, kg):
+    db.conn.execute("INSERT OR IGNORE INTO fish_caught (guild_id,user_id,fish_key,count,best_kg) VALUES (?,?,?,0,0)", (gid, uid, key))
+    db.conn.execute("UPDATE fish_caught SET count=count+1, best_kg=MAX(best_kg,?) WHERE guild_id=? AND user_id=? AND fish_key=?", (kg, gid, uid, key))
+    db.conn.commit()
+db.fish_add = _fish_add
+def _fitem_add(gid, uid, key, n=1):
+    db.conn.execute("INSERT OR IGNORE INTO fish_items (guild_id,user_id,item_key,count) VALUES (?,?,?,0)", (gid, uid, key))
+    db.conn.execute("UPDATE fish_items SET count=count+? WHERE guild_id=? AND user_id=? AND item_key=?", (n, gid, uid, key))
+    db.conn.commit()
+db.fitem_add = _fitem_add
+def _rod_list(gid, uid):
+    try:
+        return [r[0] for r in db.conn.execute("SELECT rod_key FROM fish_rods WHERE guild_id=? AND user_id=?", (gid, uid)).fetchall()]
+    except Exception:
+        return []
+db.rod_list = _rod_list
+def _bait_bag(gid, uid):
+    try:
+        return db.conn.execute("SELECT bait_key,count FROM fish_baits WHERE guild_id=? AND user_id=? AND count>0", (gid, uid)).fetchall()
+    except Exception:
+        db.conn.execute("CREATE TABLE IF NOT EXISTS fish_baits (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, bait_key TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id, bait_key))")
+        return []
+db.bait_bag = _bait_bag
+def _bait_use(gid, uid, key):
+    try:
+        db.conn.execute("UPDATE fish_baits SET count=count-1 WHERE guild_id=? AND user_id=? AND bait_key=?", (gid, uid, key))
+        db.conn.execute("DELETE FROM fish_baits WHERE guild_id=? AND user_id=? AND bait_key=? AND count<=0", (gid, uid, key))
+        db.conn.commit()
+    except Exception:
+@client.tree.command(name="fishbag", description="See your caught fish")
+@app_commands.guild_only()
+async def fishbag(interaction: discord.Interaction):
+    gid, uid = interaction.guild.id, interaction.user.id
+    rk, bk = fish_equipped(gid, uid)
+    rows = db.conn.execute("SELECT fish_key,count,best_kg FROM fish_caught WHERE guild_id=? AND user_id=? AND count>0", (gid, uid)).fetchall()
+    lines = []
+    for k, c, b in rows[:25]:
+        f = FISH_BY_KEY.get(k)
+        if f: lines.append(f"{FISH_RARITY[f[2]][2]} {f[1]} x{c} ({b}kg)")
+    items = db.conn.execute("SELECT item_key,count FROM fish_items WHERE guild_id=? AND user_id=? AND count>0", (gid, uid)).fetchall()
+    for k, c in items[:15]:
+        it = ITEM_BY_KEY.get(k) if 'ITEM_BY_KEY' in globals() else None
+        if it: lines.append(f"📦 {it[1]} x{c}")
+        else: lines.append(f"📦 {k} x{c}")
+    e = discord.Embed(title="🎒 FishBag", description="\n".join(lines) or "Empty...", colour=CREAM)
+    e.add_field(name="Rod Equipped", value=ROD_BY_KEY.get(rk, FISH_RODS[0])[1], inline=True)
+    e.add_field(name="Bait Equipped", value=(BAIT_BY_KEY.get(bk, ('','None'))[1] if bk else "None"), inline=True)
+    e.add_field(name="Fish in bag", value=str(sum(r[1] for r in rows)), inline=True)
+    v = discord.ui.View(timeout=300)
+    async def erod_cb(i):
+        if i.user.id != uid: return
+        owned = [r[0] for r in db.conn.execute("SELECT rod_key FROM fish_rods WHERE guild_id=? AND user_id=?", (gid, uid)).fetchall()] or ["stick"]
+        opts = [discord.SelectOption(label=ROD_BY_KEY[k][1], value=k) for k in owned if k in ROD_BY_KEY]
+        sv = discord.ui.View(timeout=120)
+        sel = discord.ui.Select(placeholder="Pick rod", options=opts, min_values=1, max_values=1)
+        async def scb(ii):
+            if ii.user.id != uid: return
+            db.set_flag(gid, uid, "fish_rod", sel.values[0])
+            await ii.response.send_message(f"Equipped **{ROD_BY_KEY[sel.values[0]][1]}**!", ephemeral=True)
+        sel.callback = scb; sv.add_item(sel)
+        await i.response.send_message("Choose rod:", view=sv, ephemeral=True)
+    async def ebait_cb(i):
+        if i.user.id != uid: return
+        owned = db.bait_bag(gid, uid)
+        if not owned:
+            await i.response.send_message("No bait! Buy in /fishshop.", ephemeral=True); return
+        opts = [discord.SelectOption(label=f"{BAIT_BY_KEY[k][1]} x{c}", value=k) for k, c in owned if k in BAIT_BY_KEY]
+        sv = discord.ui.View(timeout=120)
+        sel = discord.ui.Select(placeholder="Pick bait", options=opts, min_values=1, max_values=1)
+        async def scb(ii):
+            if ii.user.id != uid: return
+            db.set_flag(gid, uid, "fish_bait", sel.values[0])
+            await ii.response.send_message(f"Equipped **{BAIT_BY_KEY[sel.values[0]][1]}**!", ephemeral=True)
+        sel.callback = scb; sv.add_item(sel)
+        await i.response.send_message("Choose bait:", view=sv, ephemeral=True)
+    b1 = discord.ui.Button(label="Equip Rod", style=discord.ButtonStyle.primary); b1.callback = erod_cb
+    b2 = discord.ui.Button(label="Equip Bait", style=discord.ButtonStyle.primary); b2.callback = ebait_cb
+    v.add_item(b1); v.add_item(b2)
+    await interaction.response.send_message(embed=e, view=v)
+@client.tree.command(name="fisherstat", description="Your fishing profile")
+@app_commands.guild_only()
+async def fisherstat(interaction: discord.Interaction):
+    gid, uid = interaction.guild.id, interaction.user.id
+    lvl = level_from_xp(db.get(gid, uid)["xp"])[0]
+    tot, mx = fish_stats_total(gid, uid)
+    rk, _ = fish_equipped(gid, uid)
+    e = discord.Embed(title="Fisher Stats", colour=PINK)
+    e.set_thumbnail(url=interaction.user.display_avatar.url)
+    e.add_field(name="Level", value=str(lvl), inline=True)
+    e.add_field(name="FishCaught", value=str(tot), inline=True)
+    e.add_field(name="BestRod", value=ROD_BY_KEY.get(rk, FISH_RODS[0])[1], inline=True)
+    e.add_field(name="Max kg", value=f"{mx} kg", inline=True)
+    e.add_field(name="Rarest", value=fish_rarest(gid, uid), inline=True)
+    if lvl < 15: e.add_field(name="Locked for trading [15Lv.]", value="Reach 15!", inline=False)
+    await interaction.response.send_message(embed=e)
+@client.tree.command(name="fishdex", description="Fish bestiary")
+@app_commands.guild_only()
+async def fishdex(interaction: discord.Interaction):
+    gid, uid = interaction.guild.id, interaction.user.id
+    have = {r[0]: (r[1], r[2]) for r in db.conn.execute("SELECT fish_key,count,best_kg FROM fish_caught WHERE guild_id=? AND user_id=?", (gid, uid)).fetchall()}
+    lines = []
+    for f in FISH_SPECIES:
+        lines.append(f"{FISH_RARITY[f[2]][2]} {f[1]} x{have[f[0]][0]}" if f[0] in have else f"??? ({FISH_RARITY[f[2]][1]})")
+    e = discord.Embed(title=f"Fishdex {len(have)}/{len(FISH_SPECIES)}", description="\n".join(lines)[:4000], colour=PINK)
+    await interaction.response.send_message(embed=e)
+@client.tree.command(name="fishleaderboard", description="Biggest catches")
+@app_commands.guild_only()
+async def fishleaderboard(interaction: discord.Interaction):
+    rows = db.conn.execute("SELECT user_id,fish_key,best_kg FROM fish_caught WHERE guild_id=? AND best_kg>0 ORDER BY best_kg DESC LIMIT 10", (interaction.guild.id,)).fetchall()
+    lines = []
+    for i, (uid, k, kg) in enumerate(rows, 1):
+        m = interaction.guild.get_member(uid)
+        lines.append(f"#{i} {(m.display_name if m else '?')} {FISH_BY_KEY.get(k, ('','?'))[1]} {kg}kg")
+    await interaction.response.send_message(embed=discord.Embed(title="Biggest Catches", description="\n".join(lines) or "Empty", colour=PINK))
+@client.tree.command(name="merchant", description="Sell fish/items")
+@app_commands.guild_only()
+async def merchant(interaction: discord.Interaction):
+    gid, uid = interaction.guild.id, interaction.user.id
+    gain = 0
+    for k, c in db.conn.execute("SELECT fish_key,count FROM fish_caught WHERE guild_id=? AND user_id=?", (gid, uid)).fetchall():
+        f = FISH_BY_KEY.get(k)
+        if f: gain += f[4] * c
+    db.conn.execute("DELETE FROM fish_caught WHERE guild_id=? AND user_id=?", (gid, uid))
+    for k, c in db.conn.execute("SELECT item_key,count FROM fish_items WHERE guild_id=? AND user_id=?", (gid, uid)).fetchall():
+        it = ITEM_BY_KEY.get(k)
+        if it: gain += it[3] * c
+    db.conn.execute("DELETE FROM fish_items WHERE guild_id=? AND user_id=?", (gid, uid))
+    db.conn.commit()
+    if gain: db.add_currency(gid, uid, gain, 0)
+    await interaction.response.send_message(f"Sold for {gain} Mups!" if gain else "Nothing!")
+@client.tree.command(name="fishshop", description="Daily rods + bait")
+@app_commands.guild_only()
+async def fishshop(interaction: discord.Interaction):
+    day = int(time.time() // 86400)
+    r = random.Random(day)
+    rods = r.sample(FISH_RODS[1:], 3)
+    buyable = [b for b in FISH_BAITS if b[2] > 0]
+    baits = r.sample(buyable, min(2, len(buyable)))
+    e = discord.Embed(title="Daily FishShop", description="Rods last forever. Bait = uses.", colour=CREAM)
+    for k, n, mx, pr, res, luck, lure, sp in rods:
+        e.add_field(name=f"{n} — {pr} Mups", value=f"Max {mx}kg Res {res}% Luck {luck}% Lure {lure}%", inline=False)
+    for k, n, pr, lure, luck, res, kg, uses, sp in baits:
+        e.add_field(name=f"{n} — {pr} Mups", value=f"Lure {lure}% Luck {luck}% Res {res}%", inline=False)
+    await interaction.response.send_message(embed=e)
+@client.tree.command(name="buyrod", description="Buy a rod from the daily fishshop")
+@app_commands.describe(rod="rod name (any part, e.g. carbon)")
+@app_commands.guild_only()
+async def buyrod(interaction: discord.Interaction, rod: str):
+    gid, uid = interaction.guild.id, interaction.user.id
+    day = int(time.time() // 86400)
+    r = random.Random(day)
+    rods = r.sample(FISH_RODS[1:], 3)
+    pick = None
+    for rd in rods:
+        if rod.lower() in rd[1].lower() or rod.lower() == rd[0]:
+            pick = rd
+            break
+    if not pick:
+        await interaction.response.send_message("That rod is not in today's shop! Check /fishshop.", ephemeral=True)
+        return
+    if pick[0] in db.rod_list(gid, uid):
+        await interaction.response.send_message("You already own that rod!", ephemeral=True)
+        return
+    if not db.spend(gid, uid, pick[3], 0):
+        await interaction.response.send_message(f"Not enough Mups! Need {pick[3]}.", ephemeral=True)
+        return
+    db.conn.execute("INSERT OR IGNORE INTO fish_rods (guild_id,user_id,rod_key) VALUES (?,?,?)", (gid, uid, pick[0]))
+    db.conn.commit()
+    db.set_flag(gid, uid, "fish_rod", pick[0])
+    await interaction.response.send_message(f"You bought and equipped **{pick[1]}**!")
+@client.tree.command(name="buybait", description="Buy bait from the daily fishshop")
+@app_commands.describe(bait="bait name", amount="how many (default 1)")
+@app_commands.guild_only()
+async def buybait(interaction: discord.Interaction, bait: str, amount: int = 1):
+    gid, uid = interaction.guild.id, interaction.user.id
+    amount = max(1, min(10, amount))
+    pick = None
+    for b in FISH_BAITS:
+        if b[2] <= 0: continue
+        if bait.lower() in b[1].lower() or bait.lower() == b[0]:
+            pick = b
+            break
+    if not pick:
+        await interaction.response.send_message("Bait not found! (Seaweed, Frog, Beach Glass and Comet Shard can't be bought.)", ephemeral=True)
+        return
+    cost = pick[2] * amount
+    if not db.spend(gid, uid, cost, 0):
+        await interaction.response.send_message(f"Not enough Mups! Need {cost}.", ephemeral=True)
+        return
+    _bait_give(gid, uid, pick[0], amount * pick[7])
+    await interaction.response.send_message(f"Bought {amount}x **{pick[1]}** ({amount * pick[7]} uses) for {cost} Mups!")
+@client.tree.command(name="open", description="Open a chest (wooden, bait box, treasure...)")
+@app_commands.describe(item="which chest to open")
+@app_commands.guild_only()
+async def openchest(interaction: discord.Interaction, item: str):
+    gid, uid = interaction.guild.id, interaction.user.id
+    row = None
+    for k, c in db.conn.execute("SELECT item_key,count FROM fish_items WHERE guild_id=? AND user_id=? AND count>0", (gid, uid)).fetchall():
+        it = ITEM_BY_KEY.get(k)
+        if it and it[2] == "chest" and (item.lower() in it[1].lower() or item.lower() == k):
+            row = (k, c)
+            break
+    if not row:
+        await interaction.response.send_message("No such chest in your bag!", ephemeral=True)
+        return
+    k = row[0]
+    db.conn.execute("UPDATE fish_items SET count=count-1 WHERE guild_id=? AND user_id=? AND item_key=?", (gid, uid, k))
+    db.conn.execute("DELETE FROM fish_items WHERE guild_id=? AND user_id=? AND item_key=? AND count<=0", (gid, uid, k))
+    db.conn.commit()
+    tier = {"wooden_crate": (50, 150), "bait_box": (0, 0), "treasure_chest": (400, 900), "sea_chest": (700, 1300), "golden_chest": (1200, 2200)}.get(k, (50, 150))
+    coins = random.randint(tier[0], tier[1])
+    msg = f"Opened **{ITEM_BY_KEY[k][1]}**: +{coins} Mups!"
+    if coins: db.add_currency(gid, uid, coins, 0)
+    if k in ("bait_box", "wooden_crate"):
+        b = random.choice([x for x in FISH_BAITS if x[2] > 0])
+        _bait_give(gid, uid, b[0], 5)
+        msg += f" + 5x {b[1]}!"
+    if k in ("sea_chest", "golden_chest") and random.random() < 0.3:
+        f = random.choice([x for x in FISH_SPECIES if x[2] in ("rare", "epic")])
+        db.fish_add(gid, uid, f[0], round(f[3] * 0.5, 2))
+        msg += f" + rare fish **{f[1]}**!"
+    await interaction.response.send_message(msg)
+def _rod_give(gid, uid, key):
+    db.conn.execute("CREATE TABLE IF NOT EXISTS fish_rods (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, rod_key TEXT NOT NULL, PRIMARY KEY (guild_id, user_id, rod_key))")
+    db.conn.execute("INSERT OR IGNORE INTO fish_rods (guild_id,user_id,rod_key) VALUES (?,?,?)", (gid, uid, key))
+    db.conn.commit()
+def _bait_give2(gid, uid, key, n=1):
+    db.conn.execute("INSERT OR IGNORE INTO fish_baits (guild_id,user_id,bait_key,count) VALUES (?,?,?,0)", (gid, uid, key))
+    db.conn.execute("UPDATE fish_baits SET count=count+? WHERE guild_id=? AND user_id=? AND bait_key=?", (n, gid, uid, key))
+    db.conn.commit()
+try: _bait_give
+except NameError: _bait_give = _bait_give2
+@client.tree.command(name="trade", description="Offer a fish trade")
+@app_commands.describe(user="who to trade with")
+@app_commands.guild_only()
+async def trade(interaction: discord.Interaction, user: discord.Member):
+    gid = interaction.guild.id
+    a, b = interaction.user, user
+    if a.id == b.id:
+        await interaction.response.send_message("You can't trade with yourself!", ephemeral=True)
+        return
+    la = level_from_xp(db.get(gid, a.id)["xp"])[0]
+    lb = level_from_xp(db.get(gid, b.id)["xp"])[0]
+    if la < 15 or lb < 15:
+        await interaction.response.send_message("Both traders need level 15+! (Mups can't be traded, only fish + bait.)", ephemeral=True)
+        return
+    v = discord.ui.View(timeout=120)
+    async def yes_cb(i):
+        if i.user.id != b.id:
+            await i.response.send_message("Only they can accept!", ephemeral=True)
+            return
+        fishes = db.conn.execute("SELECT fish_key,count FROM fish_caught WHERE guild_id=? AND user_id=? AND count>0", (gid, a.id)).fetchall()
+        fishes2 = db.conn.execute("SELECT fish_key,count FROM fish_caught WHERE guild_id=? AND user_id=? AND count>0", (gid, b.id)).fetchall()
+        if not fishes or not fishes2:
+            await i.response.send_message("Both sides need at least 1 fish to trade!", ephemeral=True)
+            return
+        k1 = fishes[0][0]; k2 = fishes2[0][0]
+        db.conn.execute("UPDATE fish_caught SET count=count-1 WHERE guild_id=? AND user_id=? AND fish_key=?", (gid, a.id, k1))
+        db.conn.execute("UPDATE fish_caught SET count=count-1 WHERE guild_id=? AND user_id=? AND fish_key=?", (gid, b.id, k2))
+        db.conn.execute("DELETE FROM fish_caught WHERE guild_id=? AND count<=0", (gid,))
+        db.fish_add(gid, b.id, k1, 0.1); db.fish_add(gid, a.id, k2, 0.1)
+        await i.response.send_message(f"Traded! {a.mention} gave {FISH_BY_KEY.get(k1, ('','?'))[1]}, {b.mention} gave {FISH_BY_KEY.get(k2, ('','?'))[1]}!")
+        v.stop()
+    async def no_cb(i):
+        if i.user.id != b.id: return
+        await i.response.send_message(f"{b.mention} has declined {a.mention}'s trade!")
+        v.stop()
+    by = discord.ui.Button(label="Yes!", style=discord.ButtonStyle.success)
+    bn = discord.ui.Button(label="No", style=discord.ButtonStyle.danger)
+    by.callback = yes_cb; bn.callback = no_cb
+    v.add_item(by); v.add_item(bn)
+    await interaction.response.send_message(f"{b.mention}, {a.mention} wants to trade with you, accept?", view=v)
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN environment variable is not set")
 

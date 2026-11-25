@@ -4333,11 +4333,19 @@ async def fishshop(interaction: discord.Interaction):
         state["page"] = (state["page"] + 1) % pages
         sel.options = build_opts()
         await i.response.edit_message(embed=build_embed(), view=v)
+    async def prev_cb(i):
+        if i.user.id != interaction.user.id:
+            await i.response.send_message("Not your shop!", ephemeral=True); return
+        state["page"] = (state["page"] - 1) % pages
+        sel.options = build_opts()
+        await i.response.edit_message(embed=build_embed(), view=v)
     btn = discord.ui.Button(label="Buy", style=discord.ButtonStyle.success)
     btn.callback = buy_cb
+    prv = discord.ui.Button(label="Previous page", style=discord.ButtonStyle.secondary)
+    prv.callback = prev_cb
     nxt = discord.ui.Button(label="Next page", style=discord.ButtonStyle.primary)
     nxt.callback = next_cb
-    v.add_item(btn); v.add_item(nxt)
+    v.add_item(btn); v.add_item(prv); v.add_item(nxt)
     await interaction.response.send_message(embed=build_embed(), view=v)
 @client.tree.command(name="buyrod", description="Buy a rod from the fishshop")
 @app_commands.describe(rod="rod name (any part, e.g. carbon)")

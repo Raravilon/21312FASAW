@@ -4266,7 +4266,10 @@ async def finish_catch(interaction, member, roll, hit, qte_msg):
     key, name, rar, mx, price, desc, night, fw, need = f
     rmoji = FISH_RARITY[rar][2]
     up = roll["instant"]
-    sell = roll.get("price", price)
+    # Show the amount the current merchant will actually pay per fish.
+    # The old value came from the species base price, while the merchant uses
+    # the rarity-scaled price and today's special offer.
+    sell = fish_sell_price(key)
     db.fish_add(gid, member.id, key, roll["kg"])
     db.add_xp(gid, member.id, 5)
     db.conn.execute("INSERT INTO fish_catch_events (guild_id,user_id,fish_key,kg,weather,is_night,bait_key,shiny,mutation,caught_at) VALUES (?,?,?,?,?,?,?,?,?,?)", (gid, member.id, key, roll["kg"], roll.get("weather", "clear"), roll.get("night", int(is_night())), roll.get("bait", ""), int(roll.get("shiny", False)), roll.get("mut", ""), int(time.time())))

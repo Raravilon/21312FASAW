@@ -3872,11 +3872,13 @@ async def finish_catch(interaction, member, roll, hit, qte_msg):
     txt = f"{member.mention} caught {rmoji} {label} — {roll['kg']} kg! ({sell} Mups)"
     if roll["item"]: txt += f"\nBonus find: **{ITEM_BY_KEY[roll['item']][1]}**!"
     if roll.get("trash"): txt += f"\nEw: **{ITEM_BY_KEY[roll['trash']][1]}**..."
-    e = discord.Embed(title="🎣 Caught!", description=txt, colour=PINK)
-    try: await qte_msg.edit(content=None, embed=e, view=None)
+    e = discord.Embed(title="Caught!", description=txt, colour=PINK)
+    try: await interaction.followup.send(embed=e, ephemeral=False)
     except Exception:
         try: await interaction.channel.send(embed=e)
         except Exception: pass
+    try: await qte_msg.edit(content="Done! See the catch in chat.", embed=None, view=None)
+    except Exception: pass
     try:
         if not interaction.response.is_done(): await interaction.response.send_message("Nice catch!", ephemeral=True)
     except Exception: pass
@@ -3912,7 +3914,7 @@ async def fish(interaction: discord.Interaction):
         await interaction.response.send_message(embed=e)
         return
     view = QTEView(interaction.user, roll)
-    await interaction.response.send_message(embed=view.make_embed(), view=view)
+    await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
     try: view.msg = await interaction.original_response()
     except Exception: return
     view.task = asyncio.create_task(qte_loop(view))
@@ -3974,7 +3976,7 @@ async def fishbag(interaction: discord.Interaction):
         it = ITEM_BY_KEY.get(k) if 'ITEM_BY_KEY' in globals() else None
         if it: lines.append(f"📦 {it[1]} x{c}")
         else: lines.append(f"📦 {k} x{c}")
-    e = discord.Embed(title="🎒 FishBag", description="\n".join(lines) or "Empty...", colour=CREAM)
+    e = discord.Embed(title="FishBag", description="\n".join(lines) or "Empty...", colour=CREAM)
     e.add_field(name="Rod Equipped", value=ROD_BY_KEY.get(rk, FISH_RODS[0])[1], inline=True)
     e.add_field(name="Bait Equipped", value=(BAIT_BY_KEY.get(bk, ('','None'))[1] if bk else "None"), inline=True)
     e.add_field(name="Fish in bag", value=str(sum(r[1] for r in rows)), inline=True)
@@ -4016,7 +4018,7 @@ async def fisherstat(interaction: discord.Interaction):
     lvl = level_from_xp(db.get(gid, uid)["xp"])[0]
     tot, mx = fish_stats_total(gid, uid)
     rk, _ = fish_equipped(gid, uid)
-    e = discord.Embed(title="Fisher Stats", colour=PINK)
+    e = discord.Embed(title=f"{interaction.user.display_name} [Lv {lvl}]", colour=PINK)
     e.set_thumbnail(url=interaction.user.display_avatar.url)
     e.add_field(name="Level", value=str(lvl), inline=True)
     e.add_field(name="FishCaught", value=str(tot), inline=True)
@@ -4068,12 +4070,47 @@ async def fishshop(interaction: discord.Interaction):
     rods = r.sample(FISH_RODS[1:], 3)
     buyable = [b for b in FISH_BAITS if b[2] > 0]
     baits = r.sample(buyable, min(2, len(buyable)))
+    gid = interaction.guild.id
     e = discord.Embed(title="Daily FishShop", description="Rods last forever. Bait = uses.", colour=CREAM)
+    e.add_field(name="------- RODS -------", value="Pick one below, then press Buy.", inline=False)
     for k, n, mx, pr, res, luck, lure, sp in rods:
-        e.add_field(name=f"{n} — {pr} Mups", value=f"Max {mx}kg Res {res}% Luck {luck}% Lure {lure}%", inline=False)
+        e.add_field(name=f"{n}", value=f"Price: {pr} Mups\nMax {mx} kg\nResilience {res}%\nLuck {luck}%\nLure {lure}%", inline=False)
+    e.add_field(name="------- BAITS -------", value="Pick one below, then press Buy.", inline=False)
     for k, n, pr, lure, luck, res, kg, uses, sp in baits:
-        e.add_field(name=f"{n} — {pr} Mups", value=f"Lure {lure}% Luck {luck}% Res {res}%", inline=False)
-    await interaction.response.send_message(embed=e)
+        e.add_field(name=f"{n}", value=f"Price: {pr} Mups\nLure {lure}%\nLuck {luck}%\nResilience {res}%\nUses: {uses}", inline=False)
+    v = discord.ui.View(timeout=300)
+    all_opts = [discord.SelectOption(label=n, value="r:"+k, description=f"Rod, {pr} Mups") for k, n, mx, pr, res, luck, lure, sp in rods]
+    all_opts += [discord.SelectOption(label=n, value="b:"+k, description=f"Bait, {pr} Mups") for k, n, pr, lure, luck, res, kg, uses, sp in baits]
+    sel = discord.ui.Select(placeholder="Choose what to buy...", options=all_opts, min_values=1, max_values=1)
+    v.add_item(sel)
+    async def buy_cb(i):
+        if i.user.id != interaction.user.id:
+            await i.response.send_message("Not your shop!", ephemeral=True); return
+        vv = sel.values[0]
+        if vv.startswith("r:"):
+            pick = next((x for x in rods if x[0] == vv[2:]), None)
+            if not pick: return
+            if pick[0] in [rr[0] for rr in db.conn.execute("SELECT rod_key FROM fish_rods WHERE guild_id=? AND user_id=?", (gid, i.user.id)).fetchall()]:
+                await i.response.send_message("You already own that rod!", ephemeral=True); return
+            if not db.spend(gid, i.user.id, pick[3], 0):
+                await i.response.send_message(f"Not enough Mups! Need {pick[3]}.", ephemeral=True); return
+            db.conn.execute("INSERT OR IGNORE INTO fish_rods (guild_id,user_id,rod_key) VALUES (?,?,?)", (gid, i.user.id, pick[0]))
+            db.conn.commit()
+            db.set_flag(gid, i.user.id, "fish_rod", pick[0])
+            await i.response.send_message(f"You bought and equipped **{pick[1]}**!", ephemeral=True)
+        else:
+            pick = next((x for x in baits if x[0] == vv[2:]), None)
+            if not pick: return
+            if not db.spend(gid, i.user.id, pick[2], 0):
+                await i.response.send_message(f"Not enough Mups! Need {pick[2]}.", ephemeral=True); return
+            db.conn.execute("INSERT OR IGNORE INTO fish_baits (guild_id,user_id,bait_key,count) VALUES (?,?,?,0)", (gid, i.user.id, pick[0]))
+            db.conn.execute("UPDATE fish_baits SET count=count+? WHERE guild_id=? AND user_id=? AND bait_key=?", (pick[7], gid, i.user.id, pick[0]))
+            db.conn.commit()
+            await i.response.send_message(f"Bought **{pick[1]}** ({pick[7]} uses)!", ephemeral=True)
+    btn = discord.ui.Button(label="Buy", style=discord.ButtonStyle.success)
+    btn.callback = buy_cb
+    v.add_item(btn)
+    await interaction.response.send_message(embed=e, view=v)
 @client.tree.command(name="buyrod", description="Buy a rod from the daily fishshop")
 @app_commands.describe(rod="rod name (any part, e.g. carbon)")
 @app_commands.guild_only()
@@ -4176,32 +4213,83 @@ async def trade(interaction: discord.Interaction, user: discord.Member):
     if la < 15 or lb < 15:
         await interaction.response.send_message("Both traders need level 15+! (Mups can't be traded, only fish + bait.)", ephemeral=True)
         return
-    v = discord.ui.View(timeout=120)
-    async def yes_cb(i):
-        if i.user.id != b.id:
-            await i.response.send_message("Only they can accept!", ephemeral=True)
-            return
-        fishes = db.conn.execute("SELECT fish_key,count FROM fish_caught WHERE guild_id=? AND user_id=? AND count>0", (gid, a.id)).fetchall()
-        fishes2 = db.conn.execute("SELECT fish_key,count FROM fish_caught WHERE guild_id=? AND user_id=? AND count>0", (gid, b.id)).fetchall()
-        if not fishes or not fishes2:
-            await i.response.send_message("Both sides need at least 1 fish to trade!", ephemeral=True)
-            return
-        k1 = fishes[0][0]; k2 = fishes2[0][0]
-        db.conn.execute("UPDATE fish_caught SET count=count-1 WHERE guild_id=? AND user_id=? AND fish_key=?", (gid, a.id, k1))
-        db.conn.execute("UPDATE fish_caught SET count=count-1 WHERE guild_id=? AND user_id=? AND fish_key=?", (gid, b.id, k2))
-        db.conn.execute("DELETE FROM fish_caught WHERE guild_id=? AND count<=0", (gid,))
-        db.fish_add(gid, b.id, k1, 0.1); db.fish_add(gid, a.id, k2, 0.1)
-        await i.response.send_message(f"Traded! {a.mention} gave {FISH_BY_KEY.get(k1, ('','?'))[1]}, {b.mention} gave {FISH_BY_KEY.get(k2, ('','?'))[1]}!")
-        v.stop()
-    async def no_cb(i):
+    v = discord.ui.View(timeout=600)
+    st = {"af": None, "ab": None, "bf": None, "bb": None, "aok": False, "bok": False}
+    def _of(uid):
+        rows = db.conn.execute("SELECT fish_key,count FROM fish_caught WHERE guild_id=? AND user_id=? AND count>0", (gid, uid)).fetchall()
+        o = [discord.SelectOption(label=f"{FISH_BY_KEY[k][1]} x{c}", value="f:"+k) for k, c in rows if k in FISH_BY_KEY][:25]
+        return o or [discord.SelectOption(label="No fish", value="none")]
+    def _ob(uid):
+        rows = db.conn.execute("SELECT bait_key,count FROM fish_baits WHERE guild_id=? AND user_id=? AND count>0", (gid, uid)).fetchall()
+        o = [discord.SelectOption(label=f"{BAIT_BY_KEY[k][1]} x{c}", value="b:"+k) for k, c in rows if k in BAIT_BY_KEY][:25]
+        return o or [discord.SelectOption(label="No bait", value="none")]
+    def _nm(v):
+        if not v or v == "none": return "- empty -"
+        k = v[2:]
+        if v[0] == "f": return FISH_BY_KEY.get(k, (0, k))[1]
+        return BAIT_BY_KEY.get(k, (0, k))[1]
+    def _tx():
+        return (f"{a.display_name} offers: {_nm(st['af'])} + {_nm(st['ab'])} [{'READY' if st['aok'] else '...'}]\n{b.display_name} offers: {_nm(st['bf'])} + {_nm(st['bb'])} [{'READY' if st['bok'] else '...'}]")
+    async def _mv(giver, getter, vv):
+        if not vv or vv == "none": return True
+        k = vv[2:]
+        if vv[0] == "f":
+            r = db.conn.execute("SELECT count FROM fish_caught WHERE guild_id=? AND user_id=? AND fish_key=?", (gid, giver, k)).fetchone()
+            if not r or r[0] < 1: return False
+            db.conn.execute("UPDATE fish_caught SET count=count-1 WHERE guild_id=? AND user_id=? AND fish_key=?", (gid, giver, k))
+            db.conn.execute("DELETE FROM fish_caught WHERE guild_id=? AND user_id=? AND fish_key=? AND count<=0", (gid, giver, k))
+            db.fish_add(gid, getter, k, 0.1)
+        else:
+            r = db.conn.execute("SELECT count FROM fish_baits WHERE guild_id=? AND user_id=? AND bait_key=?", (gid, giver, k)).fetchone()
+            if not r or r[0] < 1: return False
+            db.conn.execute("UPDATE fish_baits SET count=count-1 WHERE guild_id=? AND user_id=? AND bait_key=?", (gid, giver, k))
+            db.conn.execute("DELETE FROM fish_baits WHERE guild_id=? AND user_id=? AND bait_key=? AND count<=0", (gid, giver, k))
+            db.conn.execute("INSERT OR IGNORE INTO fish_baits (guild_id,user_id,bait_key,count) VALUES (?,?,?,0)", (gid, getter, k))
+            db.conn.execute("UPDATE fish_baits SET count=count+1 WHERE guild_id=? AND user_id=? AND bait_key=?", (gid, getter, k))
+        db.conn.commit()
+        return True
+    sa = discord.ui.Select(placeholder=f"{a.display_name}: fish...", options=_of(a.id))
+    ssa = discord.ui.Select(placeholder=f"{a.display_name}: bait...", options=_ob(a.id))
+    sb = discord.ui.Select(placeholder=f"{b.display_name}: fish...", options=_of(b.id))
+    ssb = discord.ui.Select(placeholder=f"{b.display_name}: bait...", options=_ob(b.id))
+    async def _rf(i):
+        await i.response.edit_message(embed=discord.Embed(title=f"{a.display_name} / {b.display_name} Trade", description=_tx(), colour=CREAM), view=v)
+    async def _fa(i):
+        if i.user.id != a.id: return
+        st["af"] = sa.values[0]; st["aok"] = False; await _rf(i)
+    async def _aa(i):
+        if i.user.id != a.id: return
+        st["ab"] = ssa.values[0]; st["aok"] = False; await _rf(i)
+    async def _fb(i):
         if i.user.id != b.id: return
-        await i.response.send_message(f"{b.mention} has declined {a.mention}'s trade!")
-        v.stop()
-    by = discord.ui.Button(label="Yes!", style=discord.ButtonStyle.success)
-    bn = discord.ui.Button(label="No", style=discord.ButtonStyle.danger)
-    by.callback = yes_cb; bn.callback = no_cb
-    v.add_item(by); v.add_item(bn)
-    await interaction.response.send_message(f"{b.mention}, {a.mention} wants to trade with you, accept?", view=v)
+        st["bf"] = sb.values[0]; st["bok"] = False; await _rf(i)
+    async def _ab(i):
+        if i.user.id != b.id: return
+        st["bb"] = ssb.values[0]; st["bok"] = False; await _rf(i)
+    sa.callback = _fa; ssa.callback = _aa; sb.callback = _fb; ssb.callback = _ab
+    for s in (sa, ssa, sb, ssb): v.add_item(s)
+    async def _oka(i):
+        if i.user.id != a.id: return
+        st["aok"] = True
+        if st["aok"] and st["bok"]:
+            ok = await _mv(a.id, b.id, st["af"]) and await _mv(a.id, b.id, st["ab"]) and await _mv(b.id, a.id, st["bf"]) and await _mv(b.id, a.id, st["bb"])
+            await i.response.edit_message(content="Trade done!" if ok else "Trade failed: item missing.", embed=None, view=None); v.stop()
+        else: await _rf(i)
+    async def _okb(i):
+        if i.user.id != b.id: return
+        st["bok"] = True
+        if st["aok"] and st["bok"]:
+            ok = await _mv(a.id, b.id, st["af"]) and await _mv(a.id, b.id, st["ab"]) and await _mv(b.id, a.id, st["bf"]) and await _mv(b.id, a.id, st["bb"])
+            await i.response.edit_message(content="Trade done!" if ok else "Trade failed: item missing.", embed=None, view=None); v.stop()
+        else: await _rf(i)
+    async def _no(i):
+        if i.user.id not in (a.id, b.id): return
+        await i.response.edit_message(content=f"{i.user.mention} declined the trade.", embed=None, view=None); v.stop()
+    ba = discord.ui.Button(label="READY (1)", style=discord.ButtonStyle.success); ba.callback = _oka
+    bb2 = discord.ui.Button(label="READY (2)", style=discord.ButtonStyle.success); bb2.callback = _okb
+    bn = discord.ui.Button(label="Decline", style=discord.ButtonStyle.danger); bn.callback = _no
+    for x in (ba, bb2, bn): v.add_item(x)
+    await interaction.response.send_message(content=f"{b.mention}, {a.mention} wants to trade!", embed=discord.Embed(title=f"{a.display_name} / {b.display_name} Trade", description=_tx(), colour=CREAM), view=v)
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN environment variable is not set")
 

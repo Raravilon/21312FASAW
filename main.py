@@ -2296,7 +2296,7 @@ async def daily(interaction: discord.Interaction):
 
     embed = discord.Embed(
         title="Daily reward collected!",
-        description=f"Streak x{new_streak}\nYou gain {fmt_num(mups)} of Mups and {fmt_num(vups)} of Vups!\nAlso +{fmt_num(xp_exact)} XP.",
+        description=f"Streak x{new_streak}\nYou gained {fmt_num(mups)} Mups and {fmt_num(vups)} Vups!\nAlso +{fmt_num(xp_exact)} XP.",
         colour=PINK,
     )
     embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
@@ -3877,22 +3877,26 @@ class QTEView(discord.ui.View):
         lo, hi = (40, 60) if self.is_boss else (10, 16)
         self.escape_after = random.uniform(lo, hi)
         self.task = None
+        self.interaction = None
         self.pos = 0; self.dir = 1
     def bar(self):
         cells = []
         for i in range(self.bar_len):
-            if self.zstart <= i < self.zstart + self.zone: cells.append("🟩" if i == self.pos else "🟨")
-            else: cells.append("🟦" if i != self.pos else "🟥")
+            if i == self.pos:
+                # cursor: green when inside the yellow zone, red otherwise
+                cells.append("🟩" if self.zstart <= i < self.zstart + self.zone else "🟥")
+            else:
+                cells.append("🟨" if self.zstart <= i < self.zstart + self.zone else "🟦")
         return "".join(cells)
     def make_embed(self):
         f = self.roll["fish"]
         if f is None:
             it = self.roll.get("item") or self.roll.get("trash")
             iname = ITEM_BY_KEY.get(it, ("", it or "?"))[1] if it else "junk"
-            e = discord.Embed(title="🎣 Something bites!", description=f"{self.bar()}\nPress **HOOK!** when the red square is on green!\nYou feel something heavy... maybe **{iname}**?\nWEATHER_EMOJI_PLACEHOLDER", colour=CREAM)
+            e = discord.Embed(title="🎣 Something bites!", description=f"{self.bar()}\nPress **HOOK!** when the red square turns green!\nYou feel something heavy... maybe **{iname}**?\nWEATHER_EMOJI_PLACEHOLDER", colour=CREAM)
             e.description = e.description.replace("WEATHER_EMOJI_PLACEHOLDER", f"{WEATHER_EMOJI[self.roll['weather']]} {self.roll['weather'].title()}")
             return e
-        e = discord.Embed(title="🎣 Something bites!", description=f"{self.bar()}\nPress **HOOK!** when the red square is on green!\nWEATHER_EMOJI_PLACEHOLDER", colour=CREAM)
+        e = discord.Embed(title="🎣 Something bites!", description=f"{self.bar()}\nPress **HOOK!** when the red square turns green!\nWEATHER_EMOJI_PLACEHOLDER", colour=CREAM)
         e.description = e.description.replace("WEATHER_EMOJI_PLACEHOLDER", f"{WEATHER_EMOJI[self.roll['weather']]} {self.roll['weather'].title()}")
         return e
     async def interaction_check(self, interaction):
@@ -3908,11 +3912,31 @@ class QTEView(discord.ui.View):
             except Exception: pass
     @discord.ui.button(label="HOOK!", style=discord.ButtonStyle.success)
     async def hook(self, interaction, button):
-        if self.done: return
+        if self.done:
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.defer()
+            except Exception:
+                pass
+            return
         self.done = True
-        if self.task: self.task.cancel()
+        if self.task:
+            try: self.task.cancel()
+            except Exception: pass
+        try: self.stop()
+        except Exception: pass
         hit = self.zstart <= self.pos < self.zstart + self.zone
-        await finish_catch(interaction, self.member, self.roll, hit, self.msg)
+        try:
+            await finish_catch(interaction, self.member, self.roll, hit, self.msg)
+        except Exception:
+            self.done = False  # let them retry if something blew up
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("Oops, hook slipped! Press HOOK! again.", ephemeral=True)
+                else:
+                    await interaction.followup.send("Oops, hook slipped! Press HOOK! again.", ephemeral=True)
+            except Exception:
+                pass
 async def qte_loop(view):
     import time as _t
     start = _t.monotonic()
@@ -3921,7 +3945,10 @@ async def qte_loop(view):
             await asyncio.sleep(view.tick)
             if view.done: break
             if _t.monotonic() - start >= view.escape_after:
+                if view.done: break
                 view.done = True
+                try: view.stop()
+                except Exception: pass
                 await escape_catch(view)
                 break
             view.pos += view.dir
@@ -3938,7 +3965,7 @@ async def escape_catch(view):
     except Exception: pass
     try: view.stop()
     except Exception: pass
-    try: await view.msg.edit(content=f"{view.member.mention} waited too long... the fish swam away! (bait wasted)", embed=None, view=None)
+    try: await view.msg.edit(content=f"{view.member.mention} waited too long... The fish swam away! (bait wasted)", embed=None, view=None)
     except Exception: pass
     if view.task:
         try: view.task.cancel()
@@ -3958,7 +3985,7 @@ async def finish_catch(interaction, member, roll, hit, qte_msg):
         got = roll.get("item") or roll.get("trash")
         if got: db.fitem_add(gid, member.id, got)
         iname = ITEM_BY_KEY.get(got, ("", got or "?"))[1] if got else "nothing"
-        txt = f"{member.mention} fished up 📦 **{iname}**! (no fish this time)"
+        txt = f"{member.mention} fished up 📦 **{iname}**! (No fish this time.)"
         e = discord.Embed(title="Caught!", description=txt, colour=PINK)
         try: await interaction.followup.send(embed=e, ephemeral=False)
         except Exception:
@@ -4000,7 +4027,7 @@ async def fish(interaction: discord.Interaction):
     gid, uid = interaction.guild.id, interaction.user.id
     now = time.time()
     if now - fish_cd.get((gid, uid), 0) < 5:
-        await interaction.response.send_message("Wait a sec, reel in first...", ephemeral=True)
+        await interaction.response.send_message("Wait a moment, reel it in first...", ephemeral=True)
         return
     fish_cd[(gid, uid)] = now
     rod_key, bait_key = fish_equipped(gid, uid)

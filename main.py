@@ -3717,6 +3717,22 @@ FISH_ITEMS = [
 ]
 ITEM_BY_KEY = {x[0]: x for x in FISH_ITEMS}
 # ================= FISHINGpt3: engine =================
+def merchant_specials(day=None):
+    d = int((day if day is not None else time.time()) // 86400)
+    r = random.Random(10_000 + d)
+    picks = r.sample(FISH_SPECIES, 3)
+    out = []
+    for f in picks:
+        pct = r.randint(2, 10)
+        out.append((f[0], f[1], f[4], int(round(f[4] * (1 + pct / 100))), pct))
+    return d, out
+
+def merchant_price_mult(gid, fish_key, day=None):
+    d, specials = merchant_specials(day)
+    for k, _, _, buffed, pct in specials:
+        if k == fish_key:
+            return d, buffed, pct
+    return d, None, 0
 def fish_weather(now=None):
     h = int((now or time.time()) // 3600)
     r = random.Random(h // 1)
@@ -3795,16 +3811,22 @@ def fish_roll(gid, uid):
         item_drop = random.choice(["wooden_crate", "bait_box", "old_boot", "rusty_can", "bottle", "chair", "pan", "wheel"])
     instant = "instant15" in spec and random.random() < 0.15
     trash_drop = None
-    if random.random() < 0.05 and not instant:
+    # EITHER fish OR item, never both: if an item dropped, no fish this time
+    got_item_instead = False
+    if item_drop and not instant:
+        got_item_instead = True
+    elif random.random() < 0.05 and not instant and not item_drop:
         trash_drop = random.choice(["seaweed_i", "old_boot", "rusty_can", "bottle"])
-    return {"fish": chosen, "kg": kg, "shiny": shiny, "mut": mut, "item": item_drop, "trash": trash_drop, "instant": instant, "res": res + bres, "lure": lure + blure, "rod": rod, "bait": bait_key, "weather": w, "price": price}
+        got_item_instead = True
+    return {"fish": None if got_item_instead else chosen, "kg": 0 if got_item_instead else kg, "shiny": False if got_item_instead else shiny, "mut": "" if got_item_instead else mut, "item": item_drop, "trash": trash_drop, "instant": instant, "res": res + bres, "lure": lure + blure, "rod": rod, "bait": bait_key, "weather": w, "price": price}
 # ================= FISHINGpt4: QTE view =================
 class QTEView(discord.ui.View):
     def __init__(self, member, roll):
         super().__init__(timeout=30)
         self.member = member; self.roll = roll
         self.pos = 0; self.dir = 1; self.done = False; self.msg = None
-        rar = roll["fish"][2]
+        f = roll["fish"]
+        rar = f[2] if f else "common"
         self.zone = {"common": 3, "uncommon": 3, "rare": 2, "epic": 2, "legendary": 1}[rar]
         self.zstart = 2
         base = {"common": 1.4, "uncommon": 1.2, "rare": 1.0, "epic": 0.8, "legendary": 0.65}[rar]
@@ -3818,6 +3840,12 @@ class QTEView(discord.ui.View):
         return "".join(cells)
     def make_embed(self):
         f = self.roll["fish"]
+        if f is None:
+            it = self.roll.get("item") or self.roll.get("trash")
+            iname = ITEM_BY_KEY.get(it, ("", it or "?"))[1] if it else "junk"
+            e = discord.Embed(title="🎣 Something bites!", description=f"{self.bar()}\nPress **HOOK!** when the red square is on green!\nYou feel something heavy... maybe **{iname}**?\nWEATHER_EMOJI_PLACEHOLDER", colour=CREAM)
+            e.description = e.description.replace("WEATHER_EMOJI_PLACEHOLDER", f"{WEATHER_EMOJI[self.roll['weather']]} {self.roll['weather'].title()}")
+            return e
         e = discord.Embed(title="🎣 Something bites!", description=f"{self.bar()}\nPress **HOOK!** when the red square is on green!\nWEATHER_EMOJI_PLACEHOLDER", colour=CREAM)
         e.description = e.description.replace("WEATHER_EMOJI_PLACEHOLDER", f"{WEATHER_EMOJI[self.roll['weather']]} {self.roll['weather'].title()}")
         return e
@@ -3852,8 +3880,6 @@ async def qte_loop(view):
 async def finish_catch(interaction, member, roll, hit, qte_msg):
     gid = interaction.guild.id
     f = roll["fish"]
-    key, name, rar, mx, price, desc, night, fw, need = f
-    rmoji = FISH_RARITY[rar][2]
     if roll["bait"]: db.bait_use(gid, member.id, roll["bait"])
     if not hit:
         try: await qte_msg.edit(content=f"{member.mention} missed! It slipped away...", embed=None, view=None)
@@ -3861,17 +3887,32 @@ async def finish_catch(interaction, member, roll, hit, qte_msg):
         try: await interaction.response.send_message("Missed!", ephemeral=True)
         except Exception: pass
         return
+    if f is None:
+        # item-only catch: no fish this time
+        got = roll.get("item") or roll.get("trash")
+        if got: db.fitem_add(gid, member.id, got)
+        iname = ITEM_BY_KEY.get(got, ("", got or "?"))[1] if got else "nothing"
+        txt = f"{member.mention} fished up 📦 **{iname}**! (no fish this time)"
+        e = discord.Embed(title="Caught!", description=txt, colour=PINK)
+        try: await interaction.followup.send(embed=e, ephemeral=False)
+        except Exception:
+            try: await interaction.channel.send(embed=e)
+            except Exception: pass
+        try: await qte_msg.edit(content="Done! See the catch in chat.", embed=None, view=None)
+        except Exception: pass
+        try:
+            if not interaction.response.is_done(): await interaction.response.send_message("Nice catch!", ephemeral=True)
+        except Exception: pass
+        return
+    key, name, rar, mx, price, desc, night, fw, need = f
+    rmoji = FISH_RARITY[rar][2]
     up = roll["instant"]
     sell = roll.get("price", price)
     db.fish_add(gid, member.id, key, roll["kg"])
-    if roll["item"]: db.fitem_add(gid, member.id, roll["item"])
-    if roll.get("trash"): db.fitem_add(gid, member.id, roll["trash"])
     label = f"**{name}**"
     if roll["shiny"]: label = f"✨ **SHINY {name}** ✨"
     if roll["mut"]: label += f" [{roll['mut']}]"
     txt = f"{member.mention} caught {rmoji} {label} — {roll['kg']} kg! ({sell} Mups)"
-    if roll["item"]: txt += f"\nBonus find: **{ITEM_BY_KEY[roll['item']][1]}**!"
-    if roll.get("trash"): txt += f"\nEw: **{ITEM_BY_KEY[roll['trash']][1]}**..."
     e = discord.Embed(title="Caught!", description=txt, colour=PINK)
     try: await interaction.followup.send(embed=e, ephemeral=False)
     except Exception:
@@ -4031,12 +4072,24 @@ async def fisherstat(interaction: discord.Interaction):
 @app_commands.guild_only()
 async def fishdex(interaction: discord.Interaction):
     gid, uid = interaction.guild.id, interaction.user.id
-    have = {r[0]: (r[1], r[2]) for r in db.conn.execute("SELECT fish_key,count,best_kg FROM fish_caught WHERE guild_id=? AND user_id=?", (gid, uid)).fetchall()}
-    lines = []
+    have = {r[0] for r in db.conn.execute("SELECT fish_key FROM fish_caught WHERE guild_id=? AND user_id=? AND count>0", (gid, uid)).fetchall()}
+    cells = []
     for f in FISH_SPECIES:
-        lines.append(f"{FISH_RARITY[f[2]][2]} {f[1]} x{have[f[0]][0]}" if f[0] in have else f"??? ({FISH_RARITY[f[2]][1]})")
-    e = discord.Embed(title=f"Fishdex {len(have)}/{len(FISH_SPECIES)}", description="\n".join(lines)[:4000], colour=PINK)
-    await interaction.response.send_message(embed=e)
+        cells.append(f"{FISH_RARITY[f[2]][2]} {f[1]}" if f[0] in have else f"??? ({FISH_RARITY[f[2]][1]})")
+    rows = ["   ".join(cells[i:i+5]) for i in range(0, len(cells), 5)]
+    e = discord.Embed(title=f"Fishdex {len(have)}/{len(FISH_SPECIES)}", description="*" + "\n".join(rows) + "*", colour=PINK)
+    await interaction.response.send_message(embed=e, ephemeral=True)
+@client.tree.command(name="itemdex", description="Item bestiary")
+@app_commands.guild_only()
+async def itemdex(interaction: discord.Interaction):
+    gid, uid = interaction.guild.id, interaction.user.id
+    have = {r[0] for r in db.conn.execute("SELECT item_key FROM fish_items WHERE guild_id=? AND user_id=? AND count>0", (gid, uid)).fetchall()}
+    cells = []
+    for it in FISH_ITEMS:
+        cells.append(f"📦 {it[1]}" if it[0] in have else f"??? ({it[2].title()})")
+    rows = ["   ".join(cells[i:i+4]) for i in range(0, len(cells), 4)]
+    e = discord.Embed(title=f"Itemdex {len(have)}/{len(FISH_ITEMS)}", description="*" + "\n".join(rows) + "*", colour=PINK)
+    await interaction.response.send_message(embed=e, ephemeral=True)
 @client.tree.command(name="fishleaderboard", description="Biggest catches")
 @app_commands.guild_only()
 async def fishleaderboard(interaction: discord.Interaction):
@@ -4046,22 +4099,45 @@ async def fishleaderboard(interaction: discord.Interaction):
         m = interaction.guild.get_member(uid)
         lines.append(f"#{i} {(m.display_name if m else '?')} {FISH_BY_KEY.get(k, ('','?'))[1]} {kg}kg")
     await interaction.response.send_message(embed=discord.Embed(title="Biggest Catches", description="\n".join(lines) or "Empty", colour=PINK))
-@client.tree.command(name="merchant", description="Sell fish/items")
+@client.tree.command(name="merchant", description="Merchant, sell here!")
 @app_commands.guild_only()
 async def merchant(interaction: discord.Interaction):
     gid, uid = interaction.guild.id, interaction.user.id
-    gain = 0
-    for k, c in db.conn.execute("SELECT fish_key,count FROM fish_caught WHERE guild_id=? AND user_id=?", (gid, uid)).fetchall():
-        f = FISH_BY_KEY.get(k)
-        if f: gain += f[4] * c
-    db.conn.execute("DELETE FROM fish_caught WHERE guild_id=? AND user_id=?", (gid, uid))
-    for k, c in db.conn.execute("SELECT item_key,count FROM fish_items WHERE guild_id=? AND user_id=?", (gid, uid)).fetchall():
-        it = ITEM_BY_KEY.get(k)
-        if it: gain += it[3] * c
-    db.conn.execute("DELETE FROM fish_items WHERE guild_id=? AND user_id=?", (gid, uid))
-    db.conn.commit()
-    if gain: db.add_currency(gid, uid, gain, 0)
-    await interaction.response.send_message(f"Sold for {gain} Mups!" if gain else "Nothing!")
+    day, specials = merchant_specials()
+    spec_map = {k: (base, buffed, pct) for k, _, base, buffed, pct in specials}
+    e = discord.Embed(title="🧺 Merchant, Sell here!", description="Today's Special Offer! :3!!", colour=CREAM)
+    for k, name, base, buffed, pct in specials:
+        e.add_field(name=f"⭐ {name}", value=f"Price: {base} -> **{buffed}** (+{pct}%)", inline=False)
+    v = discord.ui.View(timeout=300)
+    sell_fish = discord.ui.Button(label="Sell Fish", style=discord.ButtonStyle.success, emoji="🐟")
+    sell_all = discord.ui.Button(label="Sell Everything", style=discord.ButtonStyle.primary, emoji="🧺")
+    async def _do_sell(i, sell_fish_only):
+        if i.user.id != uid:
+            await i.response.send_message("Not your merchant!", ephemeral=True); return
+        gain = 0; detail = []
+        for k, c in db.conn.execute("SELECT fish_key,count FROM fish_caught WHERE guild_id=? AND user_id=?", (gid, uid)).fetchall():
+            f = FISH_BY_KEY.get(k)
+            if not f: continue
+            if k in spec_map:
+                _, buffed, pct = spec_map[k]
+                gain += buffed * c; detail.append(f"{f[1]} x{c} @ {buffed} (special +{pct}%)")
+            else:
+                gain += f[4] * c
+        db.conn.execute("DELETE FROM fish_caught WHERE guild_id=? AND user_id=?", (gid, uid))
+        if not sell_fish_only:
+            for k, c in db.conn.execute("SELECT item_key,count FROM fish_items WHERE guild_id=? AND user_id=?", (gid, uid)).fetchall():
+                it = ITEM_BY_KEY.get(k)
+                if it: gain += it[3] * c
+            db.conn.execute("DELETE FROM fish_items WHERE guild_id=? AND user_id=?", (gid, uid))
+        db.conn.commit()
+        if gain: db.add_currency(gid, uid, gain, 0)
+        msg = f"Sold for **{gain}** Mups! :3!!" + ("\n" + "\n".join(detail[:10]) if detail else "")
+        await i.response.send_message(msg if gain else "Nothing to sell!", ephemeral=True)
+    async def sf_cb(i): await _do_sell(i, True)
+    async def sa_cb(i): await _do_sell(i, False)
+    sell_fish.callback = sf_cb; sell_all.callback = sa_cb
+    v.add_item(sell_fish); v.add_item(sell_all)
+    await interaction.response.send_message(embed=e, view=v)
 @client.tree.command(name="fishshop", description="Daily rods + bait")
 @app_commands.guild_only()
 async def fishshop(interaction: discord.Interaction):
@@ -4071,13 +4147,14 @@ async def fishshop(interaction: discord.Interaction):
     buyable = [b for b in FISH_BAITS if b[2] > 0]
     baits = r.sample(buyable, min(2, len(buyable)))
     gid = interaction.guild.id
-    e = discord.Embed(title="Daily FishShop", description="Rods last forever. Bait = uses.", colour=CREAM)
-    e.add_field(name="------- RODS -------", value="Pick one below, then press Buy.", inline=False)
+    e = discord.Embed(title="Daily FishShop", description="Rods last forever. Bait = 1 bait per 1 cast.", colour=CREAM)
+    e.add_field(name="------- RODS -------", value="**Pick one below, then press Buy.**", inline=False)
     for k, n, mx, pr, res, luck, lure, sp in rods:
-        e.add_field(name=f"{n}", value=f"Price: {pr} Mups\nMax {mx} kg\nResilience {res}%\nLuck {luck}%\nLure {lure}%", inline=False)
-    e.add_field(name="------- BAITS -------", value="Pick one below, then press Buy.", inline=False)
+        e.add_field(name=f"{n}", value=f"Price: {pr} Mups\nMax {mx} kg\nResilience {res}%\nLuck {luck}%\nLure {lure}%", inline=True)
+    e.add_field(name="\u200b", value="\u200b", inline=False)
+    e.add_field(name="------- BAITS -------", value="*Pick one below, then press Buy.*", inline=False)
     for k, n, pr, lure, luck, res, kg, uses, sp in baits:
-        e.add_field(name=f"{n}", value=f"Price: {pr} Mups\nLure {lure}%\nLuck {luck}%\nResilience {res}%\nUses: {uses}", inline=False)
+        e.add_field(name=f"{n}", value=f"Price: {pr} Mups\nLure {lure}%\nLuck {luck}%\nResilience {res}%\n1 bait = 1 cast", inline=True)
     v = discord.ui.View(timeout=300)
     all_opts = [discord.SelectOption(label=n, value="r:"+k, description=f"Rod, {pr} Mups") for k, n, mx, pr, res, luck, lure, sp in rods]
     all_opts += [discord.SelectOption(label=n, value="b:"+k, description=f"Bait, {pr} Mups") for k, n, pr, lure, luck, res, kg, uses, sp in baits]
@@ -4104,9 +4181,9 @@ async def fishshop(interaction: discord.Interaction):
             if not db.spend(gid, i.user.id, pick[2], 0):
                 await i.response.send_message(f"Not enough Mups! Need {pick[2]}.", ephemeral=True); return
             db.conn.execute("INSERT OR IGNORE INTO fish_baits (guild_id,user_id,bait_key,count) VALUES (?,?,?,0)", (gid, i.user.id, pick[0]))
-            db.conn.execute("UPDATE fish_baits SET count=count+? WHERE guild_id=? AND user_id=? AND bait_key=?", (pick[7], gid, i.user.id, pick[0]))
+            db.conn.execute("UPDATE fish_baits SET count=count+1 WHERE guild_id=? AND user_id=? AND bait_key=?", (gid, i.user.id, pick[0]))
             db.conn.commit()
-            await i.response.send_message(f"Bought **{pick[1]}** ({pick[7]} uses)!", ephemeral=True)
+            await i.response.send_message(f"Bought **{pick[1]}** (1 bait = 1 cast)!", ephemeral=True)
     btn = discord.ui.Button(label="Buy", style=discord.ButtonStyle.success)
     btn.callback = buy_cb
     v.add_item(btn)
@@ -4156,8 +4233,8 @@ async def buybait(interaction: discord.Interaction, bait: str, amount: int = 1):
     if not db.spend(gid, uid, cost, 0):
         await interaction.response.send_message(f"Not enough Mups! Need {cost}.", ephemeral=True)
         return
-    _bait_give(gid, uid, pick[0], amount * pick[7])
-    await interaction.response.send_message(f"Bought {amount}x **{pick[1]}** ({amount * pick[7]} uses) for {cost} Mups!")
+    _bait_give(gid, uid, pick[0], amount)
+    await interaction.response.send_message(f"Bought {amount}x **{pick[1]}** ({amount} casts) for {cost} Mups!")
 @client.tree.command(name="open", description="Open a chest (wooden, bait box, treasure...)")
 @app_commands.describe(item="which chest to open")
 @app_commands.guild_only()

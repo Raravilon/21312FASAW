@@ -3606,6 +3606,15 @@ def fish_rarity_display(guild, rar: str) -> str:
     except Exception:
         pass
     return fallback
+
+def rarity_hook_text(guild, roll) -> str:
+    # Emoji flashes at the HOOK moment (when the fish is on the hook), not after catching.
+    f = roll.get("fish")
+    if f is None:
+        return ""
+    rar = f[2]
+    label = FISH_RARITY.get(rar, ("", rar, ""))[1]
+    return f"{fish_rarity_display(guild, rar)} **{label} bite!**"
 # key, name, rarity, max_kg, price, desc, night_only, weather, need_bait
 FISH_SPECIES = [
 ("bubble_guppy", "Bubble Guppy", "common", 0.5, 3, "Tiny and always surprised.", 0, "", ""),
@@ -3876,9 +3885,9 @@ def bite_wait_seconds(lure: float) -> float:
     return max(3.0, base / (1 + lure / 100))
 
 class BiteView(discord.ui.View):
-    def __init__(self, member, roll):
+    def __init__(self, member, roll, guild=None):
         super().__init__(timeout=BITE_WINDOW)
-        self.member = member; self.roll = roll
+        self.member = member; self.roll = roll; self.guild = guild
         self.done = False; self.msg = None
     async def interaction_check(self, interaction):
         if interaction.user.id != self.member.id:
@@ -3910,22 +3919,22 @@ class BiteView(discord.ui.View):
             if not interaction.response.is_done():
                 await interaction.response.defer()
         except Exception: pass
-        # start the QTE minigame (the bar)
-        view = QTEView(self.member, self.roll)
+        # start the QTE minigame (the bar) — rarity emoji shows on the hook (bite moment)
+        view = QTEView(self.member, self.roll, guild=self.guild)
         try:
-            await self.msg.edit(content="Got it! Now HOOK it!", embed=view.make_embed(), view=view)
+            await self.msg.edit(content=f"Got it! {rarity_hook_text(self.guild, self.roll)} Now HOOK it!", embed=view.make_embed(), view=view)
             view.msg = self.msg
         except Exception:
             return
         view.task = asyncio.create_task(qte_loop(view))
 
-async def bite_scheduler(msg, member, roll, wait: float):
+async def bite_scheduler(msg, member, roll, wait: float, guild=None):
     try:
         await asyncio.sleep(wait)
         gid = msg.guild.id if msg and hasattr(msg, "guild") else None
         if gid and not active_casts.get((gid, member.id)):
             return  # cast was cancelled
-        view = BiteView(member, roll)
+        view = BiteView(member, roll, guild=guild)
         view.msg = msg
         try:
             await msg.edit(content=f"{member.mention} 🐟 **BITE!** Hit **Reel in**! ({BITE_WINDOW}s)", embed=None, view=view)
@@ -3936,9 +3945,9 @@ async def bite_scheduler(msg, member, roll, wait: float):
 # Bosses = hardest fish: tiny zone on a long 20-cell bar, more time to react.
 BOSS_KEYS = {"cachalot", "kraken", "tide_god", "world_serpent", "neptune", "dreadmaw", "star_eater", "ghost_whale"}
 class QTEView(discord.ui.View):
-    def __init__(self, member, roll):
+    def __init__(self, member, roll, guild=None):
         super().__init__(timeout=None)
-        self.member = member; self.roll = roll
+        self.member = member; self.roll = roll; self.guild = guild
         self.done = False; self.msg = None
         f = roll["fish"]
         rar = f[2] if f else "common"
@@ -4082,7 +4091,7 @@ async def finish_catch(interaction, member, roll, hit, qte_msg):
         except Exception: pass
         return
     key, name, rar, mx, price, desc, night, fw, need = f
-    rmoji = fish_rarity_display(interaction.guild, rar)
+    rmoji = FISH_RARITY[rar][2]
     up = roll["instant"]
     sell = roll.get("price", price)
     db.fish_add(gid, member.id, key, roll["kg"])
@@ -4131,17 +4140,18 @@ async def fish(interaction: discord.Interaction):
         f = roll["fish"]
         db.fish_add(gid, uid, f[0], roll["kg"])
         if roll["bait"]: db.bait_use(gid, uid, roll["bait"])
-        e = discord.Embed(title="🎣 INSTANT CATCH!", description=f"{interaction.user.mention} caught {fish_rarity_display(interaction.guild, f[2])} **{f[1]}** — {roll['kg']} kg! (Tornado luck!)", colour=PINK)
+        e = discord.Embed(title="🎣 INSTANT CATCH!", description=f"{interaction.user.mention} caught {FISH_RARITY[f[2]][2]} **{f[1]}** — {roll['kg']} kg! (Tornado luck!)", colour=PINK)
         await interaction.response.send_message(embed=e)
         return
-    # cast: wait for a bite, Lure shortens the wait
+    # cast: wait for a bite, Lure shortens the wait. Only the fisher sees cast/bite/HOOK;
+    # the catch result is public for everyone.
     wait = bite_wait_seconds(roll.get("lure", 0))
     lure_txt = roll.get("lure", 0)
-    await interaction.response.send_message(f"🎣 {interaction.user.mention} cast the line... Waiting for a bite... (Lure {lure_txt:+g}%)")
+    await interaction.response.send_message(f"🎣 {interaction.user.mention} cast the line... Waiting for a bite... (Lure {lure_txt:+g}%)", ephemeral=True)
     try: msg = await interaction.original_response()
     except Exception: return
     active_casts[(gid, uid)] = True
-    asyncio.create_task(bite_scheduler(msg, interaction.user, roll, wait))
+    asyncio.create_task(bite_scheduler(msg, interaction.user, roll, wait, guild=interaction.guild))
 @client.tree.command(name="weather", description="Check fishing weather")
 @app_commands.guild_only()
 async def weather(interaction: discord.Interaction):

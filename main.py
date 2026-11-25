@@ -3958,6 +3958,7 @@ def _bait_use(gid, uid, key):
         db.conn.execute("DELETE FROM fish_baits WHERE guild_id=? AND user_id=? AND bait_key=? AND count<=0", (gid, uid, key))
         db.conn.commit()
     except Exception:
+        pass
 @client.tree.command(name="fishbag", description="See your caught fish")
 @app_commands.guild_only()
 async def fishbag(interaction: discord.Interaction):

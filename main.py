@@ -940,93 +940,96 @@ async def mod_log(guild: discord.Guild, title: str, description: str):
     except (discord.Forbidden, discord.HTTPException): pass
 
 # ======================================================================
-#  Shop Data (Packs) - ALL 50% OFF
+#  Shop Data (Packs) - prices already raised: <400 Mups +180% (x2.8), >=400 +70% (x1.7)
+#  Role shop works like fish daily (merchant): only 3 items per day, refresh 00:00 UTC
 # ======================================================================
 SHOP_CATEGORIES = {
     "expie": {
         "label": "Expie Collection",
         "flag": "NEW",
         "items": [
-            {"key": "expie_heart", "name": "Expie Heart", "emoji": "Expie_Heart", "role": "Expie Heart", "description": "idk jsut a hearatea weeweweweewe", "mups": 5, "vups": 0},
-            {"key": "brain_damage", "name": "BRAIN DAMAGE", "emoji": "BRAIN_DAMAGE", "role": "BRAIN DAMAGE", "description": "Brain.exe has stopped working", "mups": 20, "vups": 0},
-            {"key": "blehh_expie", "name": "Blehh Expie", "emoji": "De_plehxpie", "role": "Blehh Expie", "description": "Blehhh!", "mups": 50, "vups": 25},
+            {"key": "expie_heart", "name": "Expie Heart", "emoji": "Expie_Heart", "role": "Expie Heart", "description": "idk jsut a hearatea weeweweweewe", "mups": 14, "vups": 0},
+            {"key": "brain_damage", "name": "BRAIN DAMAGE", "emoji": "BRAIN_DAMAGE", "role": "BRAIN DAMAGE", "description": "Brain.exe has stopped working", "mups": 56, "vups": 0},
+            {"key": "blehh_expie", "name": "Blehh Expie", "emoji": "De_plehxpie", "role": "Blehh Expie", "description": "Blehhh!", "mups": 140, "vups": 70},
         ],
     },
     "other": {
         "label": "Other",
         "flag": "",
         "items": [
-            {"key": "cool_femboy", "name": "Cool femboy", "emoji": "Da_cool_femboy", "role": "Cool femboy", "description": "Da cool femboy!", "mups": 30, "vups": 0},
-            {"key": "maplet", "name": "Maplet", "emoji": "Silly_Critter", "role": "Maplet", "description": "Little Maplefuw", "mups": 5, "vups": 0},
-            {"key": "black_catplush", "name": "Black CatPlush", "emoji": "Black_Catplush", "role": "Black CatPlush", "description": "A soft black cat plush!", "mups": 200, "vups": 0},
-            {"key": "blue_catplush", "name": "Blue CatPlush", "emoji": "Blue_catplush", "role": "Blue CatPlush", "description": "A soft blue cat plush!", "mups": 200, "vups": 0},
+            {"key": "cool_femboy", "name": "Cool femboy", "emoji": "Da_cool_femboy", "role": "Cool femboy", "description": "Da cool femboy!", "mups": 84, "vups": 0},
+            {"key": "maplet", "name": "Maplet", "emoji": "Silly_Critter", "role": "Maplet", "description": "Little Maplefuw", "mups": 14, "vups": 0},
+            {"key": "black_catplush", "name": "Black CatPlush", "emoji": "Black_Catplush", "role": "Black CatPlush", "description": "A soft black cat plush!", "mups": 560, "vups": 0},
+            {"key": "blue_catplush", "name": "Blue CatPlush", "emoji": "Blue_catplush", "role": "Blue CatPlush", "description": "A soft blue cat plush!", "mups": 560, "vups": 0},
         ],
     },
     "silly": {
         "label": "Silly Collection",
         "flag": "",
         "items": [
-            {"key": "blahaj_laying", "name": "Blahaj Laying", "emoji": "Blahaj_laying", "role": "Blahaj Laying", "description": "Classic?", "mups": 10, "vups": 0},
-            {"key": "sus_cat", "name": "Sus cat", "emoji": "Cat_Sus", "role": "Sus cat", "description": "Looks suspicious.... Is probably fine...?", "mups": 150, "vups": 50},
-            {"key": "true", "name": "TRUE...", "emoji": "De_true", "role": "TRUE...", "description": "who is he.?", "mups": 250, "vups": 0},
-            {"key": "meowzer", "name": "Meowzer", "emoji": "meoww", "role": "Meowzer", "description": "Meow meow meow!", "mups": 100, "vups": 0},
+            {"key": "blahaj_laying", "name": "Blahaj Laying", "emoji": "Blahaj_laying", "role": "Blahaj Laying", "description": "Classic?", "mups": 28, "vups": 0},
+            {"key": "sus_cat", "name": "Sus cat", "emoji": "Cat_Sus", "role": "Sus cat", "description": "Looks suspicious.... Is probably fine...?", "mups": 420, "vups": 140},
+            {"key": "true", "name": "TRUE...", "emoji": "De_true", "role": "TRUE...", "description": "who is he.?", "mups": 700, "vups": 0},
+            {"key": "meowzer", "name": "Meowzer", "emoji": "meoww", "role": "Meowzer", "description": "Meow meow meow!", "mups": 280, "vups": 0},
         ],
     },
     "minecraft": {
         "label": "Minecraft Collection",
         "flag": "NEW",
         "items": [
-            {"key": "applepan", "name": "ApplePan", "emoji": "Minecraft_Apple", "role": "ApplePan", "description": "Minecraft apple, nom nom!", "mups": 300, "vups": 0},
+            {"key": "applepan", "name": "ApplePan", "emoji": "Minecraft_Apple", "role": "ApplePan", "description": "Minecraft apple, nom nom!", "mups": 840, "vups": 0},
         ],
     },
     "furry": {
         "label": "Furry Collection",
         "flag": "NEW",
         "items": [
-            {"key": "cardboard_silly", "name": "Cardboard silly", "emoji": "Cardboard_silly", "role": "Cardboard silly", "description": "A silly critter in a cardboard box!", "mups": 550, "vups": 10},
+            {"key": "cardboard_silly", "name": "Cardboard silly", "emoji": "Cardboard_silly", "role": "Cardboard silly", "description": "A silly critter in a cardboard box!", "mups": 935, "vups": 17},
         ],
     },
     "boykisser": {
         "label": "Boykisser Collection",
         "flag": "",
         "items": [
-            {"key": "shy_boykisser", "name": "Shy Boykisser", "emoji": "Shy_kisser", "role": "Shy Boykisser", "description": "For the shy ones ~w~", "mups": 20, "vups": 0},
-            {"key": "blahaj_boykisser", "name": "Blahaj Boykisser", "emoji": "BoykisserBlahaj", "role": "Blahaj Boykisser", "description": "Hugg da sharkw!", "mups": 20, "vups": 0},
-            {"key": "paws_boykisser", "name": "Paws Boykisser", "emoji": "Paws_Boykisser", "role": "Paws Boykisser", "description": "Show them your paws", "mups": 45, "vups": 2},
-            {"key": "kiss_boykisser", "name": "Kiss boykisser", "emoji": "kissing_boykisser", "role": "Kiss boykisser", "description": "Kissing boykisser near you!", "mups": 60, "vups": 10},
-            {"key": "ice_cream_boykisser", "name": "Ice Cream Boykisser", "emoji": "icecreambkisser", "role": "Ice Cream Boykisser", "description": "Kisser in da ice cream ^^", "mups": 50, "vups": 0},
+            {"key": "shy_boykisser", "name": "Shy Boykisser", "emoji": "Shy_kisser", "role": "Shy Boykisser", "description": "For the shy ones ~w~", "mups": 56, "vups": 0},
+            {"key": "blahaj_boykisser", "name": "Blahaj Boykisser", "emoji": "BoykisserBlahaj", "role": "Blahaj Boykisser", "description": "Hugg da sharkw!", "mups": 56, "vups": 0},
+            {"key": "paws_boykisser", "name": "Paws Boykisser", "emoji": "Paws_Boykisser", "role": "Paws Boykisser", "description": "Show them your paws", "mups": 126, "vups": 6},
+            {"key": "kiss_boykisser", "name": "Kiss boykisser", "emoji": "kissing_boykisser", "role": "Kiss boykisser", "description": "Kissing boykisser near you!", "mups": 168, "vups": 28},
+            {"key": "ice_cream_boykisser", "name": "Ice Cream Boykisser", "emoji": "icecreambkisser", "role": "Ice Cream Boykisser", "description": "Kisser in da ice cream ^^", "mups": 140, "vups": 0},
         ],
     },
     "wyph": {
         "label": "WYPH COLLECTION?",
         "flag": "",
         "items": [
-            {"key": "wyphlet", "name": "Wyphlet", "emoji": "Wyphlet", "role": "Wyphlet", "description": "WAIT... A REAL WYP-", "mups": 500, "vups": 500},
+            {"key": "wyphlet", "name": "Wyphlet", "emoji": "Wyphlet", "role": "Wyphlet", "description": "WAIT... A REAL WYP-", "mups": 850, "vups": 850},
         ],
     },
     "plushie": {
         "label": "Plushie Collection",
         "flag": "NEW",
         "items": [
-            {"key": "niko_crying", "name": "Niko crying", "emoji": "Niko_crying", "role": "Niko crying", "description": "shhh... it's okay :(", "mups": 666, "vups": 10},
-            {"key": "niko_uh", "name": "Niko uh...", "emoji": "Niko_uh", "role": "Niko uh...", "description": "uh... hi?", "mups": 444, "vups": 0},
-            {"key": "teto_plush", "name": "Teto Plush", "emoji": "Teto_Plush", "role": "Teto Plush", "description": "Teto!!", "mups": 989, "vups": 0},
-            {"key": "guitar_miku", "name": "Guitar Miku", "emoji": "Guitar_Miku", "role": "Guitar Miku", "description": "Rock on!", "mups": 1400, "vups": 0},
-            {"key": "blue_plushie", "name": "BLUE PLUSHIE", "emoji": "BLUE_PLUSHIE", "role": "BLUE PLUSHIE", "description": "So blue, so soft!", "mups": 200, "vups": 0},
-            {"key": "black_plushie", "name": "BLACK PLUSHIE", "emoji": "BLACK_PLUSHIE", "role": "BLACK PLUSHIE", "description": "So dark, so soft!", "mups": 199, "vups": 0},
+            {"key": "niko_crying", "name": "Niko crying", "emoji": "Niko_crying", "role": "Niko crying", "description": "shhh... it's okay :(", "mups": 1132, "vups": 17},
+            {"key": "niko_uh", "name": "Niko uh...", "emoji": "Niko_uh", "role": "Niko uh...", "description": "uh... hi?", "mups": 755, "vups": 0},
+            {"key": "teto_plush", "name": "Teto Plush", "emoji": "Teto_Plush", "role": "Teto Plush", "description": "Teto!!", "mups": 1681, "vups": 0},
+            {"key": "guitar_miku", "name": "Guitar Miku", "emoji": "Guitar_Miku", "role": "Guitar Miku", "description": "Rock on!", "mups": 2380, "vups": 0},
+            {"key": "blue_plushie", "name": "BLUE PLUSHIE", "emoji": "BLUE_PLUSHIE", "role": "BLUE PLUSHIE", "description": "So blue, so soft!", "mups": 560, "vups": 0},
+            {"key": "black_plushie", "name": "BLACK PLUSHIE", "emoji": "BLACK_PLUSHIE", "role": "BLACK PLUSHIE", "description": "So dark, so soft!", "mups": 557, "vups": 0},
         ],
     },
 
 }
 
 def get_active_shop_categories():
-    active = {}
+    # Role shop works like fish daily merchant: ONLY 3 items per day, refresh 00:00 UTC.
     try:
         daily = daily_shop_items()
     except Exception:
         daily = []
     if daily:
-        active["daily"] = {"label": "Daily Shop", "flag": "3 items, refresh 00:00 UTC", "items": daily}
+        return {"daily": {"label": "Daily Shop", "flag": "3 items, refresh 00:00 UTC", "items": daily}}
+    # fallback if pool empty: show everything
+    active = {}
     now = time.time()
     for key, data in SHOP_CATEGORIES.items():
         if "expiry" in data and now > data["expiry"]: continue
@@ -1045,27 +1048,15 @@ def get_active_shop_categories():
                 other["items"].append(item)
     return active
 def daily_shop_items() -> list[dict]:
+    # Like fish merchant_specials: deterministic 3 random items per UTC day.
     import json as _j
     pool = [it for cat in SHOP_CATEGORIES.values() for it in cat["items"]]
     try: pool += _j.loads(db.get_setting("custom_shop_items", "[]"))
     except Exception: pass
     if not pool: return []
     day = int(time.time() // 86400)
-    r = random.Random(777 + day)
-    cheap = [i for i in pool if i.get("mups", 0) <= 50 and i.get("vups", 0) == 0] or pool
-    picks = [r.choice(cheap)]
-    rest = [i for i in pool if i.get("key") != picks[0].get("key")]
-    w = [1 / (1 + i.get("mups", 1) / 200 + i.get("vups", 0)) for i in rest]
-    while len(picks) < 3 and rest:
-        tot = sum(w)
-        x = r.random() * tot
-        for i, ww in zip(list(rest), list(w)):
-            x -= ww
-            if x <= 0:
-                picks.append(i)
-                j = rest.index(i); rest.pop(j); w.pop(j)
-                break
-    return picks
+    r = random.Random(20_000 + day)
+    return r.sample(pool, min(3, len(pool)))
 
 
 def get_custom_shop_items() -> list[dict]:
@@ -3590,6 +3581,31 @@ FISH_CHANNEL_ID = int(os.getenv("FISH_CHANNEL_ID", "1575154751723671682"))
 TRADE_MIN_LEVEL = 15
 # rarity: (weight, label, emoji)
 FISH_RARITY = {"common": (50, "Common", "🐟"), "uncommon": (28, "Uncommon", "🐠"), "rare": (14, "Rare", "💙"), "epic": (6, "Epic", "💜"), "legendary": (2, "Legendary", "🌟")}
+# Server emoji names per rarity (animated supported, found via find_emoji with fallback to unicode above).
+# New names: Normal, Seed, Mythic, Exotic, Secret, Relic, Limited, Gemstone, Divine_Secret.
+FISH_RARITY_EMOJI_NAMES = {
+    "common": "Normal",
+    "uncommon": "Seed",
+    "rare": "Mythic",
+    "epic": "Exotic",
+    "legendary": "Secret",
+    "relic": "Relic",
+    "limited": "Limited",
+    "gemstone": "Gemstone",
+    "divine": "Divine_Secret",
+    "divine_secret": "Divine_Secret",
+}
+def fish_rarity_display(guild, rar: str) -> str:
+    fallback = FISH_RARITY.get(rar, ("", rar, "🐟"))[2]
+    try:
+        name = FISH_RARITY_EMOJI_NAMES.get(rar)
+        if name and guild is not None:
+            e = find_emoji(guild, name)
+            if e is not None:
+                return str(e)
+    except Exception:
+        pass
+    return fallback
 # key, name, rarity, max_kg, price, desc, night_only, weather, need_bait
 FISH_SPECIES = [
 ("bubble_guppy", "Bubble Guppy", "common", 0.5, 3, "Tiny and always surprised.", 0, "", ""),
@@ -3849,6 +3865,74 @@ def fish_roll(gid, uid):
         got_item_instead = True
     return {"fish": None if got_item_instead else chosen, "kg": 0 if got_item_instead else kg, "shiny": False if got_item_instead else shiny, "mut": "" if got_item_instead else mut, "item": item_drop, "trash": trash_drop, "instant": instant, "res": res + bres, "lure": lure + blure, "rod": rod, "bait": bait_key, "weather": w, "price": price}
 # ================= FISHINGpt4: QTE view =================
+# Bite wait: cast -> wait 7-18s scaled by Lure -> BITE button (5s, fixed) -> QTE minigame.
+BITE_BASE_MIN = 7.0
+BITE_BASE_MAX = 18.0
+BITE_WINDOW = 5  # seconds to press Reel in; nothing affects it
+active_casts: dict[tuple[int, int], bool] = {}
+
+def bite_wait_seconds(lure: float) -> float:
+    base = random.uniform(BITE_BASE_MIN, BITE_BASE_MAX)
+    return max(3.0, base / (1 + lure / 100))
+
+class BiteView(discord.ui.View):
+    def __init__(self, member, roll):
+        super().__init__(timeout=BITE_WINDOW)
+        self.member = member; self.roll = roll
+        self.done = False; self.msg = None
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.member.id:
+            await interaction.response.send_message("Not your rod!", ephemeral=True)
+            return False
+        return True
+    async def on_timeout(self):
+        if self.done: return
+        self.done = True
+        active_casts.pop((self.msg.guild.id, self.member.id), None) if self.msg and self.msg.guild else None
+        try: await self.msg.edit(content=f"{self.member.mention} waited too long... It slipped away! 💨 (bait wasted)", embed=None, view=None)
+        except Exception: pass
+        try:
+            if self.roll.get("bait"):
+                gid = self.msg.guild.id if self.msg and hasattr(self.msg, "guild") else None
+                if gid: db.bait_use(gid, self.member.id, self.roll["bait"])
+        except Exception: pass
+    @discord.ui.button(label="🎣 Reel in!", style=discord.ButtonStyle.success)
+    async def reel(self, interaction, button):
+        if interaction.user.id != self.member.id:
+            await interaction.response.send_message("Not your rod!", ephemeral=True)
+            return
+        if self.done: return
+        self.done = True
+        try: self.stop()
+        except Exception: pass
+        active_casts.pop((interaction.guild.id, self.member.id), None)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+        except Exception: pass
+        # start the QTE minigame (the bar)
+        view = QTEView(self.member, self.roll)
+        try:
+            await self.msg.edit(content="Got it! Now HOOK it!", embed=view.make_embed(), view=view)
+            view.msg = self.msg
+        except Exception:
+            return
+        view.task = asyncio.create_task(qte_loop(view))
+
+async def bite_scheduler(msg, member, roll, wait: float):
+    try:
+        await asyncio.sleep(wait)
+        gid = msg.guild.id if msg and hasattr(msg, "guild") else None
+        if gid and not active_casts.get((gid, member.id)):
+            return  # cast was cancelled
+        view = BiteView(member, roll)
+        view.msg = msg
+        try:
+            await msg.edit(content=f"{member.mention} 🐟 **BITE!** Hit **Reel in**! ({BITE_WINDOW}s)", embed=None, view=view)
+        except Exception:
+            active_casts.pop((gid, member.id), None) if gid else None
+    except asyncio.CancelledError:
+        pass
 # Bosses = hardest fish: tiny zone on a long 20-cell bar, more time to react.
 BOSS_KEYS = {"cachalot", "kraken", "tide_god", "world_serpent", "neptune", "dreadmaw", "star_eater", "ghost_whale"}
 class QTEView(discord.ui.View):
@@ -3866,15 +3950,15 @@ class QTEView(discord.ui.View):
         elif self.is_boss:
             self.zone = 2
         else:
-            self.zone = {"common": 3, "uncommon": 3, "rare": 2, "epic": 2, "legendary": 2}[rar]
+            self.zone = {"common": 4, "uncommon": 4, "rare": 3, "epic": 3, "legendary": 2}[rar]
         self.zstart = (self.bar_len - self.zone) // 2
         # faster cursor, faster for rarer fish
-        base = {"common": 0.7, "uncommon": 0.6, "rare": 0.5, "epic": 0.4, "legendary": 0.3}
+        base = {"common": 0.8, "uncommon": 0.7, "rare": 0.6, "epic": 0.55, "legendary": 0.45}
         b = base.get(rar, 0.7) if f else 0.7
         self.tick = max(0.15, b * (1 - min(50, max(-50, roll["res"])) / 100))
         # escape timer: fish swims away if you wait too long (bait is wasted).
-        # normal: 10-16s, boss: 40-60s. No visible timer.
-        lo, hi = (40, 60) if self.is_boss else (10, 16)
+        # normal: 20-32s, boss: 80-120s. No visible timer.
+        lo, hi = (80, 120) if self.is_boss else (20, 32)
         self.escape_after = random.uniform(lo, hi)
         self.task = None
         self.interaction = None
@@ -3998,7 +4082,7 @@ async def finish_catch(interaction, member, roll, hit, qte_msg):
         except Exception: pass
         return
     key, name, rar, mx, price, desc, night, fw, need = f
-    rmoji = FISH_RARITY[rar][2]
+    rmoji = fish_rarity_display(interaction.guild, rar)
     up = roll["instant"]
     sell = roll.get("price", price)
     db.fish_add(gid, member.id, key, roll["kg"])
@@ -4026,6 +4110,9 @@ async def fish(interaction: discord.Interaction):
         return
     gid, uid = interaction.guild.id, interaction.user.id
     now = time.time()
+    if active_casts.get((gid, uid)):
+        await interaction.response.send_message("⏳ Your line is already in the water!", ephemeral=True)
+        return
     if now - fish_cd.get((gid, uid), 0) < 5:
         await interaction.response.send_message("Wait a moment, reel it in first...", ephemeral=True)
         return
@@ -4044,14 +4131,17 @@ async def fish(interaction: discord.Interaction):
         f = roll["fish"]
         db.fish_add(gid, uid, f[0], roll["kg"])
         if roll["bait"]: db.bait_use(gid, uid, roll["bait"])
-        e = discord.Embed(title="🎣 INSTANT CATCH!", description=f"{interaction.user.mention} caught {FISH_RARITY[f[2]][2]} **{f[1]}** — {roll['kg']} kg! (Tornado luck!)", colour=PINK)
+        e = discord.Embed(title="🎣 INSTANT CATCH!", description=f"{interaction.user.mention} caught {fish_rarity_display(interaction.guild, f[2])} **{f[1]}** — {roll['kg']} kg! (Tornado luck!)", colour=PINK)
         await interaction.response.send_message(embed=e)
         return
-    view = QTEView(interaction.user, roll)
-    await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
-    try: view.msg = await interaction.original_response()
+    # cast: wait for a bite, Lure shortens the wait
+    wait = bite_wait_seconds(roll.get("lure", 0))
+    lure_txt = roll.get("lure", 0)
+    await interaction.response.send_message(f"🎣 {interaction.user.mention} cast the line... Waiting for a bite... (Lure {lure_txt:+g}%)")
+    try: msg = await interaction.original_response()
     except Exception: return
-    view.task = asyncio.create_task(qte_loop(view))
+    active_casts[(gid, uid)] = True
+    asyncio.create_task(bite_scheduler(msg, interaction.user, roll, wait))
 @client.tree.command(name="weather", description="Check fishing weather")
 @app_commands.guild_only()
 async def weather(interaction: discord.Interaction):

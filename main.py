@@ -3927,35 +3927,6 @@ def fish_db_init():
     db.conn.commit()
 def fish_db_init2():
     db.conn.execute("CREATE TABLE IF NOT EXISTS fish_items (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, item_key TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id, item_key))")
-FISH_SPECIES += [
-("wobblefish", "Wobblefish", "common", 1.1, 5, "Wobbles everywhere.", 0, "", ""),
-("tadpole_tom", "Tadpole Tom", "common", 0.4, 3, "Just a tadpole.", 0, "", ""),
-("slippy", "Slippy Slimefish", "common", 0.9, 5, "Too slippery.", 0, "", ""),
-("crumb_carp", "Crumb Carp", "common", 2.2, 7, "Eats leftovers.", 0, "", ""),
-("blinkfish", "Blinkfish", "common", 0.5, 4, "Blinks a lot.", 0, "", ""),
-("snicker_eel", "Snicker Eel", "uncommon", 4.2, 16, "Snickers softly.", 0, "", ""),
-("marble_minnow", "Marble Minnow", "uncommon", 3.2, 15, "Swirly colors.", 0, "", ""),
-("puff_pout", "Puff Pout", "uncommon", 5.2, 18, "Pouts when hungry.", 0, "", ""),
-("twirl_trout", "Twirl Trout", "uncommon", 6.5, 21, "Spins in circles.", 0, "", ""),
-("glow_guppy", "Glow Guppy", "uncommon", 2.5, 14, "Glows a little.", 0, "", ""),
-("mist_mackerel", "Mist Mackerel", "rare", 11.0, 44, "Hides in mist.", 0, "fog", ""),
-("dream_dory", "Dream Dory", "rare", 9.0, 41, "Sleepy swimmer.", 1, "", ""),
-("rosefin", "Rosefin", "rare", 13.0, 50, "Smells like roses.", 0, "", ""),
-("static_stingray", "Static Stingray", "rare", 17.0, 60, "Sparks fly.", 0, "storm", ""),
-("comet_chub", "Comet Chub", "rare", 16.0, 56, "Leaves a trail.", 0, "", ""),
-("kraken_baby", "Kraken Baby", "epic", 300.0, 400, "Small but grabby.", 0, "", "kraken_tentacle"),
-("voidfin", "Voidfin", "epic", 150.0, 330, "Dark waters.", 0, "", "starlight_dust"),
-("moon_jelly", "Moon Jelly", "epic", 40.0, 240, "Night glow.", 1, "", ""),
-("phoenix_fish", "Phoenix Fish", "epic", 90.0, 300, "Reborn in fire.", 0, "", ""),
-("opalfin_tuna", "Opalfin Tuna", "epic", 200.0, 370, "Shiny giant.", 0, "", ""),
-("star_eater", "Star Eater", "legendary", 6000.0, 3500, "Eats stars.", 0, "", "starlight_dust"),
-("dreadmaw", "Dreadmaw", "legendary", 8000.0, 4000, "Fear itself.", 0, "", ""),
-("neptune", "Neptune's Heir", "legendary", 9500.0, 5500, "Royal blood.", 0, "", ""),
-("ghost_whale", "Ghost Whale", "legendary", 7500.0, 4200, "Haunts ships.", 1, "", ""),
-("world_serpent", "World Serpent", "legendary", 15000.0, 8000, "Wraps the ocean.", 0, "", ""),
-]
-FISH_BY_KEY = {f[0]: f for f in FISH_SPECIES}
-
     db.conn.commit()
 fish_db_init2()
 def _fish_add(gid, uid, key, kg):

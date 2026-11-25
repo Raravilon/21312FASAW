@@ -3665,6 +3665,23 @@ FISH_SPECIES = [
 ("world_serpent", "World Serpent", "legendary", 15000.0, 8000, "Wraps the ocean.", 0, "", ""),
 ]
 FISH_BY_KEY = {f[0]: f for f in FISH_SPECIES}
+# Lower sell prices: scale by rarity (cheaper economy).
+_FISH_PRICE_SCALE = {"common": 0.5, "uncommon": 0.5, "rare": 0.4, "epic": 0.3, "legendary": 0.2}
+_FISH_ITEMS_SCALE = 0.5
+def _scaled_fish_price(f):
+    return max(1, int(round(f[4] * _FISH_PRICE_SCALE.get(f[2], 0.5))))
+def fish_sell_price(fish_key):
+    f = FISH_BY_KEY.get(fish_key)
+    if not f: return 0
+    _, specials = merchant_specials()
+    for k, _, base, buffed, pct in specials:
+        if k == fish_key:
+            return int(round(_scaled_fish_price(f) * (1 + pct / 100)))
+    return _scaled_fish_price(f)
+def item_sell_price(item_key):
+    it = ITEM_BY_KEY.get(item_key)
+    if not it: return 0
+    return max(1, int(round(it[3] * _FISH_ITEMS_SCALE)))
 # key, name, maxkg, price, res, luck, lure, special
 FISH_RODS = [
 ("stick", "Stick Rod", 5, 5, 0, 0, 0, ""),
@@ -3724,7 +3741,8 @@ def merchant_specials(day=None):
     out = []
     for f in picks:
         pct = r.randint(2, 10)
-        out.append((f[0], f[1], f[4], int(round(f[4] * (1 + pct / 100))), pct))
+        base = _scaled_fish_price(f)
+        out.append((f[0], f[1], base, int(round(base * (1 + pct / 100))), pct))
     return d, out
 
 def merchant_price_mult(gid, fish_key, day=None):
@@ -3820,21 +3838,38 @@ def fish_roll(gid, uid):
         got_item_instead = True
     return {"fish": None if got_item_instead else chosen, "kg": 0 if got_item_instead else kg, "shiny": False if got_item_instead else shiny, "mut": "" if got_item_instead else mut, "item": item_drop, "trash": trash_drop, "instant": instant, "res": res + bres, "lure": lure + blure, "rod": rod, "bait": bait_key, "weather": w, "price": price}
 # ================= FISHINGpt4: QTE view =================
+# Bosses = hardest fish: tiny zone on a long 20-cell bar, more time to react.
+BOSS_KEYS = {"cachalot", "kraken", "tide_god", "world_serpent", "neptune", "dreadmaw", "star_eater", "ghost_whale"}
 class QTEView(discord.ui.View):
     def __init__(self, member, roll):
-        super().__init__(timeout=30)
+        super().__init__(timeout=None)
         self.member = member; self.roll = roll
-        self.pos = 0; self.dir = 1; self.done = False; self.msg = None
+        self.done = False; self.msg = None
         f = roll["fish"]
         rar = f[2] if f else "common"
-        self.zone = {"common": 3, "uncommon": 3, "rare": 2, "epic": 2, "legendary": 1}[rar]
-        self.zstart = 2
-        base = {"common": 1.4, "uncommon": 1.2, "rare": 1.0, "epic": 0.8, "legendary": 0.65}[rar]
-        self.tick = max(0.3, base * (1 - min(50, max(-50, roll["res"])) / 100))
+        self.is_boss = bool(f) and (f[0] in BOSS_KEYS or rar == "legendary")
+        # longer bar: 15 cells normal (zone of 3 yellows), 20 cells boss (zone of 2)
+        self.bar_len = 20 if self.is_boss else 15
+        if f is None:
+            self.zone = 4
+        elif self.is_boss:
+            self.zone = 2
+        else:
+            self.zone = {"common": 3, "uncommon": 3, "rare": 2, "epic": 2, "legendary": 2}[rar]
+        self.zstart = (self.bar_len - self.zone) // 2
+        # faster cursor, faster for rarer fish
+        base = {"common": 0.7, "uncommon": 0.6, "rare": 0.5, "epic": 0.4, "legendary": 0.3}
+        b = base.get(rar, 0.7) if f else 0.7
+        self.tick = max(0.15, b * (1 - min(50, max(-50, roll["res"])) / 100))
+        # escape timer: fish swims away if you wait too long (bait is wasted).
+        # normal: 10-16s, boss: 40-60s. No visible timer.
+        lo, hi = (40, 60) if self.is_boss else (10, 16)
+        self.escape_after = random.uniform(lo, hi)
         self.task = None
+        self.pos = 0; self.dir = 1
     def bar(self):
         cells = []
-        for i in range(7):
+        for i in range(self.bar_len):
             if self.zstart <= i < self.zstart + self.zone: cells.append("🟩" if i == self.pos else "🟨")
             else: cells.append("🟦" if i != self.pos else "🟥")
         return "".join(cells)
@@ -3868,15 +3903,35 @@ class QTEView(discord.ui.View):
         hit = self.zstart <= self.pos < self.zstart + self.zone
         await finish_catch(interaction, self.member, self.roll, hit, self.msg)
 async def qte_loop(view):
+    import time as _t
+    start = _t.monotonic()
     try:
         while not view.done:
             await asyncio.sleep(view.tick)
+            if view.done: break
+            if _t.monotonic() - start >= view.escape_after:
+                view.done = True
+                await escape_catch(view)
+                break
             view.pos += view.dir
-            if view.pos >= 6: view.pos = 6; view.dir = -1
+            if view.pos >= view.bar_len - 1: view.pos = view.bar_len - 1; view.dir = -1
             if view.pos <= 0: view.pos = 0; view.dir = 1
             try: await view.msg.edit(embed=view.make_embed(), view=view)
             except Exception: break
     except asyncio.CancelledError: pass
+async def escape_catch(view):
+    try:
+        gid = view.msg.guild.id if view.msg and hasattr(view.msg, "guild") else None
+        if view.roll.get("bait") and gid:
+            db.bait_use(gid, view.member.id, view.roll["bait"])
+    except Exception: pass
+    try: view.stop()
+    except Exception: pass
+    try: await view.msg.edit(content=f"{view.member.mention} waited too long... the fish swam away! (bait wasted)", embed=None, view=None)
+    except Exception: pass
+    if view.task:
+        try: view.task.cancel()
+        except Exception: pass
 async def finish_catch(interaction, member, roll, hit, qte_msg):
     gid = interaction.guild.id
     f = roll["fish"]
@@ -4117,24 +4172,62 @@ async def merchant(interaction: discord.Interaction):
             await i.response.send_message("Not your merchant!", ephemeral=True); return
         gain = 0; detail = []
         for k, c in db.conn.execute("SELECT fish_key,count FROM fish_caught WHERE guild_id=? AND user_id=?", (gid, uid)).fetchall():
-            f = FISH_BY_KEY.get(k)
-            if not f: continue
             if k in spec_map:
                 _, buffed, pct = spec_map[k]
-                gain += buffed * c; detail.append(f"{f[1]} x{c} @ {buffed} (special +{pct}%)")
+                gain += buffed * c; detail.append(f"{FISH_BY_KEY.get(k,(k,k))[1]} x{c} @ {buffed} (special +{pct}%)")
             else:
-                gain += f[4] * c
+                gain += fish_sell_price(k) * c
         db.conn.execute("DELETE FROM fish_caught WHERE guild_id=? AND user_id=?", (gid, uid))
         if not sell_fish_only:
             for k, c in db.conn.execute("SELECT item_key,count FROM fish_items WHERE guild_id=? AND user_id=?", (gid, uid)).fetchall():
-                it = ITEM_BY_KEY.get(k)
-                if it: gain += it[3] * c
+                gain += item_sell_price(k) * c
             db.conn.execute("DELETE FROM fish_items WHERE guild_id=? AND user_id=?", (gid, uid))
         db.conn.commit()
         if gain: db.add_currency(gid, uid, gain, 0)
         msg = f"Sold for **{gain}** Mups! :3!!" + ("\n" + "\n".join(detail[:10]) if detail else "")
         await i.response.send_message(msg if gain else "Nothing to sell!", ephemeral=True)
-    async def sf_cb(i): await _do_sell(i, True)
+    async def sf_cb(i):
+        # Fish picker: choose species + amount
+        if i.user.id != uid:
+            await i.response.send_message("Not your merchant!", ephemeral=True); return
+        rows = db.conn.execute("SELECT fish_key,count FROM fish_caught WHERE guild_id=? AND user_id=? ORDER BY count DESC", (gid, uid)).fetchall()
+        rows = [(k, c) for k, c in rows if FISH_BY_KEY.get(k)]
+        if not rows:
+            await i.response.send_message("Nothing to sell!", ephemeral=True); return
+        opts = []
+        for k, c in rows[:25]:
+            f = FISH_BY_KEY[k]
+            price = spec_map[k][1] if k in spec_map else fish_sell_price(k)
+            star = "⭐ " if k in spec_map else ""
+            opts.append(discord.SelectOption(label=f"{f[1]} x{c}", value=k, description=f"{star}{price} Mups each", emoji="🐟"))
+        v2 = discord.ui.View(timeout=300)
+        sel = discord.ui.Select(placeholder="Choose a fish...", options=opts, min_values=1, max_values=1)
+        class SellModal(discord.ui.Modal, title="Sell fish"):
+            answer = discord.ui.TextInput(label="How many?", placeholder="number or 'all'", default="all", max_length=10)
+            async def on_submit(self, mi: discord.Interaction):
+                fk = sel.values[0] if sel.values else None
+                if not fk:
+                    await mi.response.send_message("Pick a fish first!", ephemeral=True); return
+                have = db.conn.execute("SELECT count FROM fish_caught WHERE guild_id=? AND user_id=? AND fish_key=?", (gid, uid, fk)).fetchone()
+                have = have[0] if have else 0
+                if have <= 0:
+                    await mi.response.send_message("You don't have that fish!", ephemeral=True); return
+                raw = str(self.answer.value or "all").strip().lower()
+                n = have if raw in ("all", "max", "все") else max(0, int(''.join(ch for ch in raw if ch.isdigit()) or 0))
+                n = min(max(n, 1), have)
+                price = spec_map[fk][1] if fk in spec_map else fish_sell_price(fk)
+                gain2 = price * n
+                if n >= have:
+                    db.conn.execute("DELETE FROM fish_caught WHERE guild_id=? AND user_id=? AND fish_key=?", (gid, uid, fk))
+                else:
+                    db.conn.execute("UPDATE fish_caught SET count=count-? WHERE guild_id=? AND user_id=? AND fish_key=?", (n, gid, uid, fk))
+                db.conn.commit(); db.add_currency(gid, uid, gain2, 0)
+                await mi.response.send_message(f"Sold {FISH_BY_KEY[fk][1]} x{n} for **{gain2}** Mups! :3", ephemeral=True)
+        async def sel_cb(si):
+            await si.response.send_modal(SellModal())
+        sel.callback = sel_cb
+        v2.add_item(sel)
+        await i.response.send_message("Pick a fish, then type how many:", view=v2, ephemeral=True)
     async def sa_cb(i): await _do_sell(i, False)
     sell_fish.callback = sf_cb; sell_all.callback = sa_cb
     v.add_item(sell_fish); v.add_item(sell_all)

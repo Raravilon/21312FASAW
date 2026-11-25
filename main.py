@@ -328,6 +328,11 @@ class Database:
         self.conn.execute("CREATE TABLE IF NOT EXISTS fish_items (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, item_key TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id, item_key))")
         self.conn.execute("CREATE TABLE IF NOT EXISTS fish_rods (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, rod_key TEXT NOT NULL, PRIMARY KEY (guild_id, user_id, rod_key))")
         self.conn.execute("CREATE TABLE IF NOT EXISTS fish_baits (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, bait_key TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id, bait_key))")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS fish_catch_events (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, fish_key TEXT NOT NULL, kg REAL NOT NULL, weather TEXT NOT NULL DEFAULT 'clear', is_night INTEGER NOT NULL DEFAULT 0, bait_key TEXT NOT NULL DEFAULT '', shiny INTEGER NOT NULL DEFAULT 0, mutation TEXT NOT NULL DEFAULT '', caught_at INTEGER NOT NULL)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS fishing_quests (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, quest_key TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', started_at INTEGER NOT NULL, completed_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id))")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS fishing_quest_history (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, quest_key TEXT NOT NULL, completed_at INTEGER NOT NULL, PRIMARY KEY (guild_id, user_id, quest_key))")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS fishing_weekly (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, week_key TEXT NOT NULL, quest_key TEXT NOT NULL, claimed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id, week_key))")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS fishing_item_events (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, item_key TEXT NOT NULL, caught_at INTEGER NOT NULL)")
 
         self.conn.commit()
 
@@ -3872,7 +3877,164 @@ def fish_roll(gid, uid):
     elif random.random() < 0.05 and not instant and not item_drop:
         trash_drop = random.choice(["seaweed_i", "old_boot", "rusty_can", "bottle"])
         got_item_instead = True
-    return {"fish": None if got_item_instead else chosen, "kg": 0 if got_item_instead else kg, "shiny": False if got_item_instead else shiny, "mut": "" if got_item_instead else mut, "item": item_drop, "trash": trash_drop, "instant": instant, "res": res + bres, "lure": lure + blure, "rod": rod, "bait": bait_key, "weather": w, "price": price}
+    return {"fish": None if got_item_instead else chosen, "kg": 0 if got_item_instead else kg, "shiny": False if got_item_instead else shiny, "mut": "" if got_item_instead else mut, "item": item_drop, "trash": trash_drop, "instant": instant, "res": res + bres, "lure": lure + blure, "rod": rod, "bait": bait_key, "weather": w, "night": int(is_night()), "price": price}
+
+# ================= FISHING QUESTS =================
+FISHING_QUESTS = [
+    {"key": "laundry_day", "title": "Laundry Day at the Pond", "stars": 1,
+     "description": "Something smells funky near the shallows, and it is not the mud.",
+     "requirements": [("common", "Catch 5 Common fish", 5), ("fish:sockfish", "Sockfish", 1), ("fish:mud_minnow", "Mud Minnow", 1)],
+     "reward": (50, 10, [])},
+    {"key": "giggles_shallows", "title": "Giggles in the Shallows", "stars": 2,
+     "description": "The local pond has way too much attitude. Reel in the rowdiest bunch.",
+     "requirements": [("fish:grumbletad", "Grumbletad", 1), ("fish:giggle_goby", "Giggle Goby", 1), ("fish:snicker_eel", "Snicker Eel", 1), ("fish:puff_pout", "Puff Pout", 1)],
+     "reward": (150, 25, [])},
+    {"key": "bad_weather", "title": "Bad Weather, Good Catch", "stars": 3,
+     "description": "Real anglers do not pack up when the forecast turns nasty.",
+     "requirements": [("weather:mist_mackerel:fog", "Mist Mackerel during fog", 1), ("weather:thunder_eel:rain", "Thunder Eel during rain", 1), ("weather:static_stingray:storm", "Static Stingray during storm", 1)],
+     "reward": (500, 100, [("starlight_dust", 3)])},
+    {"key": "creatures_night", "title": "Creatures of the Night", "stars": 4,
+     "description": "When the sun goes down, the strange creatures wake up.",
+     "requirements": [("night:moonlight_eel", "Moonlight Eel at night", 1), ("night:sleepy_starfish", "Sleepy Starfish at night", 1), ("night:moon_jelly", "Moon Jelly at night", 1), ("fish:void_eel", "Void Eel", 1)],
+     "reward": (2000, 250, [("kraken_tentacle", 2)])},
+    {"key": "royal_abyss", "title": "Royal Court of the Abyss", "stars": 5,
+     "description": "Only a master angler can pull royalty from the deep.",
+     "requirements": [("fish:sunken_crownfish", "Sunken Crownfish", 1), ("fish:abyss_king", "Abyss King", 1), ("fish:neptune", "Neptune's Heir", 1), ("fish:kraken", "Kraken", 1)],
+     "reward": (5000, 1000, [])},
+]
+FISHING_QUEST_BY_KEY = {q["key"]: q for q in FISHING_QUESTS}
+WEEKLY_QUESTS = [
+    ("heavy_catch", "Heavy Catch", "Catch one fish weighing at least 500 kg.", (750, 100, [])),
+    ("deep_sea_haul", "Deep Sea Haul", "Catch 3 fish with a combined weight of at least 2,000 kg.", (1500, 200, [("kraken_tentacle", 1)])),
+    ("legendary_weight", "Legendary Weight", "Catch a Legendary fish weighing at least 5,000 kg.", (3000, 400, [])),
+    ("weather_watcher", "Weather Watcher", "Catch fish during rain, fog, and storm.", (800, 125, [("thunder", 2)])),
+    ("rare_collection", "Rare Collection", "Catch 5 different Rare or better fish.", (1200, 175, [("starlight_dust", 1)])),
+    ("chest_hunter", "Chest Hunter", "Find 3 fishing chests.", (900, 100, [("worm", 5)])),
+    ("night_fisher", "Night Fisher", "Catch 5 fish while it is nighttime.", (1000, 150, [("starlight_dust", 1)])),
+    ("shiny_search", "Shiny Search", "Catch one Shiny fish.", (2500, 300, [])),
+    ("abyssal_challenge", "Abyssal Challenge", "Catch a fish weighing at least 8,000 kg or any Legendary fish.", (4000, 500, [])),
+]
+WEEKLY_BY_KEY = {q[0]: q for q in WEEKLY_QUESTS}
+
+def _quest_count(gid, uid, requirement):
+    rows = db.conn.execute("SELECT fish_key,kg,weather,is_night,shiny,mutation FROM fish_catch_events WHERE guild_id=? AND user_id=?", (gid, uid)).fetchall()
+    kind = requirement.split(":")
+    if kind[0] == "common": return min(sum(1 for r in rows if FISH_BY_KEY.get(r[0], (None, None, ""))[2] == "common"), 5)
+    return sum(1 for r in rows if r[0] == kind[1] and ((kind[0] == "weather" and r[2] == kind[2]) or (kind[0] == "night" and r[3]) or kind[0] == "fish"))
+
+def _quest_progress(gid, uid, q):
+    return [_quest_count(gid, uid, req[0]) for req in q["requirements"]]
+
+def _quest_complete(gid, uid, q):
+    return all(value >= req[2] for value, req in zip(_quest_progress(gid, uid, q), q["requirements"]))
+
+def _grant_fishing_reward(gid, uid, reward):
+    mups, vups, items = reward
+    db.add_currency(gid, uid, mups, vups)
+    for item_key, amount in items:
+        if item_key in BAIT_BY_KEY:
+            _bait_give(gid, uid, item_key, amount)
+        else:
+            db.fitem_add(gid, uid, item_key, amount)
+
+def _active_quest(gid, uid):
+    row = db.conn.execute("SELECT quest_key,status FROM fishing_quests WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
+    return FISHING_QUEST_BY_KEY.get(row[0]) if row and row[1] == "active" else None
+
+def _start_next_quest(gid, uid):
+    done = {r[0] for r in db.conn.execute("SELECT quest_key FROM fishing_quest_history WHERE guild_id=? AND user_id=?", (gid, uid)).fetchall()}
+    q = next((q for q in FISHING_QUESTS if q["key"] not in done), None)
+    if q:
+        db.conn.execute("INSERT OR REPLACE INTO fishing_quests (guild_id,user_id,quest_key,status,started_at,completed_at) VALUES (?,?,?,'active',?,0)", (gid, uid, q["key"], int(time.time())))
+        db.conn.commit()
+    return q
+
+def _weekly_for(gid, uid):
+    week = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-W%W")
+    row = db.conn.execute("SELECT quest_key,claimed FROM fishing_weekly WHERE guild_id=? AND user_id=? AND week_key=?", (gid, uid, week)).fetchone()
+    if row: return week, WEEKLY_BY_KEY[row[0]], bool(row[1])
+    seed = sum(ord(c) for c in f"{gid}:{uid}:{week}")
+    q = WEEKLY_QUESTS[seed % len(WEEKLY_QUESTS)]
+    db.conn.execute("INSERT INTO fishing_weekly (guild_id,user_id,week_key,quest_key,claimed) VALUES (?,?,?,?,0)", (gid, uid, week, q[0]))
+    db.conn.commit()
+    return week, q, False
+
+def _weekly_progress(gid, uid, q):
+    week_start = int((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=datetime.datetime.now(datetime.timezone.utc).weekday())).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    rows = db.conn.execute("SELECT fish_key,kg,weather,is_night,shiny FROM fish_catch_events WHERE guild_id=? AND user_id=? AND caught_at>=?", (gid, uid, week_start)).fetchall()
+    key = q[0]
+    if key == "heavy_catch": return min(max((r[1] for r in rows), default=0), 500), 500
+    if key == "deep_sea_haul": return min(sum(r[1] for r in rows), 2000), 2000
+    if key == "legendary_weight": return min(max((r[1] for r in rows if FISH_BY_KEY.get(r[0], (0,0,""))[2] == "legendary"), default=0), 5000), 5000
+    if key == "weather_watcher": return len({r[2] for r in rows if r[2] in ("rain", "fog", "storm")}), 3
+    if key == "rare_collection": return len({r[0] for r in rows if FISH_BY_KEY.get(r[0], (0,0,""))[2] in ("rare", "epic", "legendary")}), 5
+    if key == "night_fisher": return sum(1 for r in rows if r[3]), 5
+    if key == "shiny_search": return min(sum(1 for r in rows if r[4]), 1), 1
+    if key == "abyssal_challenge": return min(sum(1 for r in rows if r[1] >= 8000 or FISH_BY_KEY.get(r[0], (0,0,""))[2] == "legendary"), 1), 1
+    if key == "chest_hunter":
+        chest_keys = {x[0] for x in FISH_ITEMS if x[2] == "chest"}
+        count = db.conn.execute("SELECT COUNT(*) FROM fishing_item_events WHERE guild_id=? AND user_id=? AND caught_at>=? AND item_key IN (%s)" % ",".join("?" * len(chest_keys)), (gid, uid, week_start, *chest_keys)).fetchone()[0]
+        return min(count, 3), 3
+    return 0, 3
+
+def _complete_ready_quests(gid, uid):
+    notices = []
+    current = _active_quest(gid, uid)
+    if current and _quest_complete(gid, uid, current):
+        _grant_fishing_reward(gid, uid, current["reward"])
+        db.conn.execute("UPDATE fishing_quests SET status='completed',completed_at=? WHERE guild_id=? AND user_id=?", (int(time.time()), gid, uid))
+        db.conn.execute("INSERT OR IGNORE INTO fishing_quest_history (guild_id,user_id,quest_key,completed_at) VALUES (?,?,?,?)", (gid, uid, current["key"], int(time.time())))
+        notices.append(f"\n🎉 Quest complete: **{current['title']}**")
+    week, weekly, claimed = _weekly_for(gid, uid)
+    weekly_value, weekly_goal = _weekly_progress(gid, uid, weekly)
+    weekly_done = weekly_value >= weekly_goal
+    if weekly[0] == "deep_sea_haul":
+        week_start = int((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=datetime.datetime.now(datetime.timezone.utc).weekday())).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        weekly_done = db.conn.execute("SELECT COUNT(*) FROM fish_catch_events WHERE guild_id=? AND user_id=? AND caught_at>=?", (gid, uid, week_start)).fetchone()[0] >= 3 and weekly_done
+    if weekly_done and not claimed:
+        _grant_fishing_reward(gid, uid, weekly[3])
+        db.conn.execute("UPDATE fishing_weekly SET claimed=1 WHERE guild_id=? AND user_id=? AND week_key=?", (gid, uid, week))
+        notices.append(f"\n📅 Weekly quest complete: **{weekly[1]}**")
+    db.conn.commit()
+    return notices
+
+@client.tree.command(name="quest", description="View your active fishing quest")
+@app_commands.guild_only()
+async def quest(interaction: discord.Interaction):
+    gid, uid = interaction.guild.id, interaction.user.id
+    q = _active_quest(gid, uid)
+    if not q:
+        history_count = db.conn.execute("SELECT COUNT(*) FROM fishing_quest_history WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()[0]
+        message = "You have completed every fishing quest." if history_count >= len(FISHING_QUESTS) else "You do not have an active fishing quest. Find and open a Message in a Bottle to begin."
+        await interaction.response.send_message(message, ephemeral=True)
+        return
+    progress = _quest_progress(gid, uid, q)
+    stars = "★" * q["stars"] + "☆" * (5 - q["stars"])
+    lines = [f"{'✅' if value >= req[2] else '⬜'} {req[1]}: {min(value, req[2])}/{req[2]}" for value, req in zip(progress, q["requirements"])]
+    m, v, items = q["reward"]
+    reward = f"{m:,} Mups\n{v:,} Vups"
+    if items:
+        reward += "\n" + ", ".join(f"{n}x {BAIT_BY_KEY.get(k, ITEM_BY_KEY.get(k, ('', k)))[1]}" for k, n in items)
+    e = discord.Embed(title=f"📜 {q['title']} {stars}", description=f"{q['description']}\n\n" + "\n".join(lines), colour=PINK)
+    e.add_field(name="Reward", value=reward, inline=False)
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+@client.tree.command(name="weeklyquest", description="View your weekly fishing quest")
+@app_commands.guild_only()
+async def weeklyquest(interaction: discord.Interaction):
+    gid, uid = interaction.guild.id, interaction.user.id
+    _, q, claimed = _weekly_for(gid, uid)
+    value, goal = _weekly_progress(gid, uid, q)
+    lines = [f"{'✅' if value >= goal else '⬜'} Progress: {value:g}/{goal:g}"]
+    m, v, items = q[3]
+    reward = f"{m:,} Mups\n{v:,} Vups"
+    if items:
+        reward += "\n" + ", ".join(f"{n}x {BAIT_BY_KEY.get(k, ITEM_BY_KEY.get(k, ('', k)))[1]}" for k, n in items)
+    e = discord.Embed(title=f"📅 Weekly Quest: {q[1]}", description=q[2] + "\n\n" + "\n".join(lines), colour=CREAM)
+    e.add_field(name="Reward", value=reward, inline=False)
+    if claimed:
+        e.set_footer(text="Completed this week")
+    await interaction.response.send_message(embed=e, ephemeral=True)
 # ================= FISHINGpt4: QTE view =================
 # Bite wait: cast -> wait 7-18s scaled by Lure -> BITE button (5s, fixed) -> QTE minigame.
 BITE_BASE_MIN = 7.0
@@ -3901,9 +4063,11 @@ class BiteView(discord.ui.View):
         try: await self.msg.edit(content=f"{self.member.mention} waited too long... It slipped away! 💨 (bait wasted)", embed=None, view=None)
         except Exception: pass
         try:
-            if self.roll.get("bait"):
+            if self.roll.get("bait") and not self.roll.get("bait_consumed"):
                 gid = self.msg.guild.id if self.msg and hasattr(self.msg, "guild") else None
-                if gid: db.bait_use(gid, self.member.id, self.roll["bait"])
+                if gid:
+                    db.bait_use(gid, self.member.id, self.roll["bait"])
+                    self.roll["bait_consumed"] = True
         except Exception: pass
     @discord.ui.button(label="🎣 Reel in!", style=discord.ButtonStyle.success)
     async def reel(self, interaction, button):
@@ -4053,8 +4217,9 @@ async def qte_loop(view):
 async def escape_catch(view):
     try:
         gid = view.msg.guild.id if view.msg and hasattr(view.msg, "guild") else None
-        if view.roll.get("bait") and gid:
+        if view.roll.get("bait") and gid and not view.roll.get("bait_consumed"):
             db.bait_use(gid, view.member.id, view.roll["bait"])
+            view.roll["bait_consumed"] = True
     except Exception: pass
     try: view.stop()
     except Exception: pass
@@ -4066,7 +4231,11 @@ async def escape_catch(view):
 async def finish_catch(interaction, member, roll, hit, qte_msg):
     gid = interaction.guild.id
     f = roll["fish"]
-    if roll["bait"]: db.bait_use(gid, member.id, roll["bait"])
+    # Bait is consumed when the cast starts. This guard keeps old/in-progress
+    # rolls from consuming it a second time when they finish.
+    if roll["bait"] and not roll.get("bait_consumed"):
+        db.bait_use(gid, member.id, roll["bait"])
+        roll["bait_consumed"] = True
     if not hit:
         try: await qte_msg.edit(content=f"{member.mention} missed! It slipped away...", embed=None, view=None)
         except Exception: pass
@@ -4076,9 +4245,13 @@ async def finish_catch(interaction, member, roll, hit, qte_msg):
     if f is None:
         # item-only catch: no fish this time
         got = roll.get("item") or roll.get("trash")
-        if got: db.fitem_add(gid, member.id, got)
+        if got:
+            db.fitem_add(gid, member.id, got)
+            db.conn.execute("INSERT INTO fishing_item_events (guild_id,user_id,item_key,caught_at) VALUES (?,?,?,?)", (gid, member.id, got, int(time.time())))
+            db.conn.commit()
         iname = ITEM_BY_KEY.get(got, ("", got or "?"))[1] if got else "nothing"
-        txt = f"{member.mention} fished up 📦 **{iname}**! (No fish this time.)"
+        notices = _complete_ready_quests(gid, member.id) if got else []
+        txt = f"{member.mention} fished up 📦 **{iname}**! (No fish this time.)" + "".join(notices)
         e = discord.Embed(title="Caught!", description=txt, colour=PINK)
         try: await interaction.followup.send(embed=e, ephemeral=False)
         except Exception:
@@ -4095,10 +4268,32 @@ async def finish_catch(interaction, member, roll, hit, qte_msg):
     up = roll["instant"]
     sell = roll.get("price", price)
     db.fish_add(gid, member.id, key, roll["kg"])
+    db.add_xp(gid, member.id, 5)
+    db.conn.execute("INSERT INTO fish_catch_events (guild_id,user_id,fish_key,kg,weather,is_night,bait_key,shiny,mutation,caught_at) VALUES (?,?,?,?,?,?,?,?,?,?)", (gid, member.id, key, roll["kg"], roll.get("weather", "clear"), roll.get("night", int(is_night())), roll.get("bait", ""), int(roll.get("shiny", False)), roll.get("mut", ""), int(time.time())))
+    db.conn.commit()
+    quest_notice = []
+    current = _active_quest(gid, member.id)
+    if current and _quest_complete(gid, member.id, current):
+        _grant_fishing_reward(gid, member.id, current["reward"])
+        db.conn.execute("UPDATE fishing_quests SET status='completed',completed_at=? WHERE guild_id=? AND user_id=?", (int(time.time()), gid, member.id))
+        db.conn.execute("INSERT OR IGNORE INTO fishing_quest_history (guild_id,user_id,quest_key,completed_at) VALUES (?,?,?,?)", (gid, member.id, current["key"], int(time.time())))
+        db.conn.commit()
+        quest_notice.append(f"\n🎉 Quest complete: **{current['title']}**")
+    week, weekly, claimed = _weekly_for(gid, member.id)
+    weekly_value, weekly_goal = _weekly_progress(gid, member.id, weekly)
+    weekly_done = (weekly_value >= weekly_goal)
+    if weekly[0] == "deep_sea_haul":
+        week_start = int((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=datetime.datetime.now(datetime.timezone.utc).weekday())).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        weekly_done = sum(1 for r in db.conn.execute("SELECT id FROM fish_catch_events WHERE guild_id=? AND user_id=? AND caught_at>=?", (gid, member.id, week_start)).fetchall()) >= 3 and weekly_value >= weekly_goal
+    if weekly_done and not claimed:
+        _grant_fishing_reward(gid, member.id, weekly[3])
+        db.conn.execute("UPDATE fishing_weekly SET claimed=1 WHERE guild_id=? AND user_id=? AND week_key=?", (gid, member.id, week))
+        db.conn.commit()
+        quest_notice.append(f"\n📅 Weekly quest complete: **{weekly[1]}**")
     label = f"**{name}**"
     if roll["shiny"]: label = f"✨ **SHINY {name}** ✨"
     if roll["mut"]: label += f" [{roll['mut']}]"
-    txt = f"{member.mention} caught {rmoji} {label} — {roll['kg']} kg! ({sell} Mups)"
+    txt = f"{member.mention} caught {rmoji} {label} — {roll['kg']} kg! ({sell} Mups)\n+✨ +5 XP" + "".join(quest_notice)
     e = discord.Embed(title="Caught!", description=txt, colour=PINK)
     try: await interaction.followup.send(embed=e, ephemeral=False)
     except Exception:
@@ -4136,11 +4331,20 @@ async def fish(interaction: discord.Interaction):
             db.set_flag(gid, uid, "fish_bait", "")
             bait_key = ""
     roll = fish_roll(gid, uid)
+    # Consume bait at cast creation, before any message or QTE is shown.
+    # Deleting/dismissing a fishing message must never allow the same bait
+    # to be rerolled into another catch.
+    if roll["bait"]:
+        db.bait_use(gid, uid, roll["bait"])
+        roll["bait_consumed"] = True
     if roll["instant"]:
         f = roll["fish"]
         db.fish_add(gid, uid, f[0], roll["kg"])
-        if roll["bait"]: db.bait_use(gid, uid, roll["bait"])
-        e = discord.Embed(title="🎣 INSTANT CATCH!", description=f"{interaction.user.mention} caught {FISH_RARITY[f[2]][2]} **{f[1]}** — {roll['kg']} kg! (Tornado luck!)", colour=PINK)
+        db.add_xp(gid, uid, 5)
+        db.conn.execute("INSERT INTO fish_catch_events (guild_id,user_id,fish_key,kg,weather,is_night,bait_key,shiny,mutation,caught_at) VALUES (?,?,?,?,?,?,?,?,?,?)", (gid, uid, f[0], roll["kg"], roll.get("weather", "clear"), roll.get("night", int(is_night())), roll.get("bait", ""), int(roll.get("shiny", False)), roll.get("mut", ""), int(time.time())))
+        db.conn.commit()
+        notices = _complete_ready_quests(gid, uid)
+        e = discord.Embed(title="🎣 INSTANT CATCH!", description=f"{interaction.user.mention} caught {FISH_RARITY[f[2]][2]} **{f[1]}** — {roll['kg']} kg! (Tornado luck!)\\n✨ +5 XP" + "".join(notices), colour=PINK)
         await interaction.response.send_message(embed=e)
         return
     # cast: wait for a bite, Lure shortens the wait. Only the fisher sees cast/bite/HOOK;
@@ -4523,6 +4727,22 @@ async def buybait(interaction: discord.Interaction, bait: str, amount: int = 1):
 @app_commands.guild_only()
 async def openchest(interaction: discord.Interaction, item: str):
     gid, uid = interaction.guild.id, interaction.user.id
+    bottle = next((x for x in FISH_ITEMS if x[0] == "bottle"), None)
+    bottle_row = db.conn.execute("SELECT count FROM fish_items WHERE guild_id=? AND user_id=? AND item_key='bottle' AND count>0", (gid, uid)).fetchone()
+    if bottle and bottle_row and (item.lower() in bottle[1].lower() or item.lower() == "bottle" or item.lower() == "message in a bottle"):
+        if _active_quest(gid, uid):
+            await interaction.response.send_message("You already have an active quest. Finish it before opening another quest bottle.", ephemeral=True)
+            return
+        quest = _start_next_quest(gid, uid)
+        if not quest:
+            await interaction.response.send_message("You have completed every fishing quest. The bottle is empty.", ephemeral=True)
+            return
+        db.conn.execute("UPDATE fish_items SET count=count-1 WHERE guild_id=? AND user_id=? AND item_key='bottle'", (gid, uid))
+        db.conn.execute("DELETE FROM fish_items WHERE guild_id=? AND user_id=? AND item_key='bottle' AND count<=0", (gid, uid))
+        db.conn.commit()
+        stars = "★" * quest["stars"] + "☆" * (5 - quest["stars"])
+        await interaction.response.send_message(f"📜 **{quest['title']}** {stars}\n\n{quest['description']}\n\nYou received a new quest. Use **/quest** to view your progress.")
+        return
     row = None
     for k, c in db.conn.execute("SELECT item_key,count FROM fish_items WHERE guild_id=? AND user_id=? AND count>0", (gid, uid)).fetchall():
         it = ITEM_BY_KEY.get(k)

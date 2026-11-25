@@ -145,7 +145,7 @@ PING_ROLES = [
     ("Chat.. revive!", "Chat.. REVIVE"),
 ]
 
-DB_PATH = os.getenv("DB_PATH", "data/bot.db")
+DB_PATH = os.getenv("DB_PATH", os.path.join(os.getenv("DATA_DIR", "data"), "bot.db"))
 
 PINK = discord.Colour.from_str("#f4b6c2")
 CREAM = discord.Colour.from_str("#f7e7d3")
@@ -3771,11 +3771,22 @@ def fish_equipped(gid, uid):
     if isinstance(rod, float) and rod.is_integer(): rod = FISH_RODS[int(rod)][0]
     return (rod if rod in ROD_BY_KEY else "stick", bk if bk in BAIT_BY_KEY else "")
 def fish_stats_total(gid, uid):
+    # Lifetime stats (survive selling) — fall back to bag contents for old saves.
+    try:
+        row = db.conn.execute("SELECT COALESCE(SUM(total),0),COALESCE(MAX(best_kg),0) FROM fish_lifetime WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
+        if row and row[0]:
+            return row[0], row[1]
+    except Exception:
+        pass
     row = db.conn.execute("SELECT COALESCE(SUM(count),0),COALESCE(MAX(best_kg),0) FROM fish_caught WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
     return row[0], row[1]
 def fish_rarest(gid, uid):
     order = {"common": 0, "uncommon": 1, "rare": 2, "epic": 3, "legendary": 4}
     rows = db.conn.execute("SELECT fish_key,count FROM fish_caught WHERE guild_id=? AND user_id=? AND count>0", (gid, uid)).fetchall()
+    try:
+        rows = rows + [(r[0], r[1]) for r in db.conn.execute("SELECT fish_key,total FROM fish_lifetime WHERE guild_id=? AND user_id=? AND total>0", (gid, uid)).fetchall()]
+    except Exception:
+        pass
     best, bs = None, -1
     for k, _ in rows:
         f = FISH_BY_KEY.get(k)
@@ -4020,9 +4031,11 @@ async def weather(interaction: discord.Interaction):
     w = fish_weather()
     await interaction.response.send_message(f"{WEATHER_EMOJI[w]} Current weather: **{w.title()}**" + (" — rare fish bite better!" if w in ("rain", "storm") else ""))
 def fish_db_init():
-    for q in ("CREATE TABLE IF NOT EXISTS fish_caught (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, fish_key TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, best_kg REAL NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id, fish_key))",):
+    for q in ("CREATE TABLE IF NOT EXISTS fish_caught (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, fish_key TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, best_kg REAL NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id, fish_key))",
+              "CREATE TABLE IF NOT EXISTS fish_lifetime (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, fish_key TEXT NOT NULL, total INTEGER NOT NULL DEFAULT 0, best_kg REAL NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id, fish_key))",):
         db.conn.execute(q)
     db.conn.commit()
+fish_db_init()
 def fish_db_init2():
     db.conn.execute("CREATE TABLE IF NOT EXISTS fish_items (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, item_key TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (guild_id, user_id, item_key))")
     db.conn.commit()
@@ -4030,6 +4043,8 @@ fish_db_init2()
 def _fish_add(gid, uid, key, kg):
     db.conn.execute("INSERT OR IGNORE INTO fish_caught (guild_id,user_id,fish_key,count,best_kg) VALUES (?,?,?,0,0)", (gid, uid, key))
     db.conn.execute("UPDATE fish_caught SET count=count+1, best_kg=MAX(best_kg,?) WHERE guild_id=? AND user_id=? AND fish_key=?", (kg, gid, uid, key))
+    db.conn.execute("INSERT OR IGNORE INTO fish_lifetime (guild_id,user_id,fish_key,total,best_kg) VALUES (?,?,?,0,0)", (gid, uid, key))
+    db.conn.execute("UPDATE fish_lifetime SET total=total+1, best_kg=MAX(best_kg,?) WHERE guild_id=? AND user_id=? AND fish_key=?", (kg, gid, uid, key))
     db.conn.commit()
 db.fish_add = _fish_add
 def _fitem_add(gid, uid, key, n=1):
@@ -4129,6 +4144,10 @@ async def fisherstat(interaction: discord.Interaction):
 async def fishdex(interaction: discord.Interaction):
     gid, uid = interaction.guild.id, interaction.user.id
     have = {r[0] for r in db.conn.execute("SELECT fish_key FROM fish_caught WHERE guild_id=? AND user_id=? AND count>0", (gid, uid)).fetchall()}
+    try:
+        have |= {r[0] for r in db.conn.execute("SELECT fish_key FROM fish_lifetime WHERE guild_id=? AND user_id=? AND total>0", (gid, uid)).fetchall()}
+    except Exception:
+        pass
     cells = []
     for f in FISH_SPECIES:
         cells.append(f"{FISH_RARITY[f[2]][2]} {f[1]}" if f[0] in have else f"??? ({FISH_RARITY[f[2]][1]})")
@@ -4232,34 +4251,64 @@ async def merchant(interaction: discord.Interaction):
     sell_fish.callback = sf_cb; sell_all.callback = sa_cb
     v.add_item(sell_fish); v.add_item(sell_all)
     await interaction.response.send_message(embed=e, view=v)
-@client.tree.command(name="fishshop", description="Daily rods + bait")
+@client.tree.command(name="fishshop", description="Fishing shop: rods + bait")
 @app_commands.guild_only()
 async def fishshop(interaction: discord.Interaction):
-    day = int(time.time() // 86400)
-    r = random.Random(day)
-    rods = r.sample(FISH_RODS[1:], 3)
-    buyable = [b for b in FISH_BAITS if b[2] > 0]
-    baits = r.sample(buyable, min(2, len(buyable)))
     gid = interaction.guild.id
-    e = discord.Embed(title="Daily FishShop", description="Rods last forever. Bait = 1 bait per 1 cast.", colour=CREAM)
-    e.add_field(name="------- RODS -------", value="**Pick one below, then press Buy.**", inline=False)
-    for k, n, mx, pr, res, luck, lure, sp in rods:
-        e.add_field(name=f"{n}", value=f"Price: {pr} Mups\nMax {mx} kg\nResilience {res}%\nLuck {luck}%\nLure {lure}%", inline=True)
-    e.add_field(name="\u200b", value="\u200b", inline=False)
-    e.add_field(name="------- BAITS -------", value="*Pick one below, then press Buy.*", inline=False)
-    for k, n, pr, lure, luck, res, kg, uses, sp in baits:
-        e.add_field(name=f"{n}", value=f"Price: {pr} Mups\nLure {lure}%\nLuck {luck}%\nResilience {res}%\n1 bait = 1 cast", inline=True)
+    rods_sorted = sorted(FISH_RODS, key=lambda r: r[3])
+    baits_sorted = sorted([b for b in FISH_BAITS if b[2] > 0], key=lambda b: b[2])
+    pages = max((len(rods_sorted) + 2) // 3, (len(baits_sorted) + 2) // 3)
+    state = {"page": 0}
+    def build_embed():
+        pg = state["page"]
+        e = discord.Embed(title="FishShop", description=f"**Pick one below, then press Buy.**\nPAGE {pg + 1}/{pages}", colour=CREAM)
+        rpage = rods_sorted[pg * 3:pg * 3 + 3]
+        bpage = baits_sorted[pg * 3:pg * 3 + 3]
+        def col3(items, rows_fn, widths):
+            # items: up to 3, padded so the table keeps 3 columns
+            items = list(items) + [None] * (3 - len(items))
+            cols = []
+            for it in items:
+                cols.append(rows_fn(it) if it else [""] * len(widths))
+            lines = []
+            for r in range(len(widths)):
+                parts = []
+                for c in range(3):
+                    parts.append(cols[c][r].ljust(widths[r]))
+                lines.append("  ".join(parts).rstrip())
+            return "\n".join(lines)
+        def rod_rows(rod):
+            k, n, mx, pr, res, luck, lure, sp = rod
+            return [n[:20], f"Price: {pr} Mups", f"Max {mx} kg", f"Resilience {res}%", f"Luck {luck}%", f"Lure {lure}%"]
+        def bait_rows(bait):
+            k, n, pr, lure, luck, res, kg, uses, sp = bait
+            return [n[:20], f"Price: {pr} Mups", f"Lure {lure}%", f"Luck {luck}%", f"Resilience {res}%"]
+        # column widths = widest cell in this page per row (min 20) so columns line up
+        def widths_for(pg_items, rows_fn, nrows, minw=20):
+            w = [minw] * nrows
+            for it in pg_items:
+                for i, cell in enumerate(rows_fn(it)):
+                    w[i] = max(w[i], len(cell) + 2)
+            return w
+        rw = widths_for(rpage, rod_rows, 6)
+        bw = widths_for(bpage, bait_rows, 5)
+        e.add_field(name="------- RODS -------", value="```\n" + col3(rpage, rod_rows, rw) + "\n```", inline=False)
+        e.add_field(name="------- BAITS -------", value="```\n" + col3(bpage, bait_rows, bw) + "\n```\n*1 bait = 1 cast. Use /buybait <name> <amount> for bulk.*", inline=False)
+        return e
+    def build_opts():
+        pg = state["page"]
+        opts = [discord.SelectOption(label=n, value="r:" + k, description=f"Rod, {pr} Mups") for k, n, mx, pr, res, luck, lure, sp in rods_sorted[pg * 3:pg * 3 + 3]]
+        opts += [discord.SelectOption(label=n, value="b:" + k, description=f"Bait, {pr} Mups") for k, n, pr, lure, luck, res, kg, uses, sp in baits_sorted[pg * 3:pg * 3 + 3]]
+        return opts
     v = discord.ui.View(timeout=300)
-    all_opts = [discord.SelectOption(label=n, value="r:"+k, description=f"Rod, {pr} Mups") for k, n, mx, pr, res, luck, lure, sp in rods]
-    all_opts += [discord.SelectOption(label=n, value="b:"+k, description=f"Bait, {pr} Mups") for k, n, pr, lure, luck, res, kg, uses, sp in baits]
-    sel = discord.ui.Select(placeholder="Choose what to buy...", options=all_opts, min_values=1, max_values=1)
+    sel = discord.ui.Select(placeholder="Choose what to buy...", options=build_opts(), min_values=1, max_values=1)
     v.add_item(sel)
     async def buy_cb(i):
         if i.user.id != interaction.user.id:
             await i.response.send_message("Not your shop!", ephemeral=True); return
         vv = sel.values[0]
         if vv.startswith("r:"):
-            pick = next((x for x in rods if x[0] == vv[2:]), None)
+            pick = next((x for x in rods_sorted if x[0] == vv[2:]), None)
             if not pick: return
             if pick[0] in [rr[0] for rr in db.conn.execute("SELECT rod_key FROM fish_rods WHERE guild_id=? AND user_id=?", (gid, i.user.id)).fetchall()]:
                 await i.response.send_message("You already own that rod!", ephemeral=True); return
@@ -4270,7 +4319,7 @@ async def fishshop(interaction: discord.Interaction):
             db.set_flag(gid, i.user.id, "fish_rod", pick[0])
             await i.response.send_message(f"You bought and equipped **{pick[1]}**!", ephemeral=True)
         else:
-            pick = next((x for x in baits if x[0] == vv[2:]), None)
+            pick = next((x for x in baits_sorted if x[0] == vv[2:]), None)
             if not pick: return
             if not db.spend(gid, i.user.id, pick[2], 0):
                 await i.response.send_message(f"Not enough Mups! Need {pick[2]}.", ephemeral=True); return
@@ -4278,25 +4327,30 @@ async def fishshop(interaction: discord.Interaction):
             db.conn.execute("UPDATE fish_baits SET count=count+1 WHERE guild_id=? AND user_id=? AND bait_key=?", (gid, i.user.id, pick[0]))
             db.conn.commit()
             await i.response.send_message(f"Bought **{pick[1]}** (1 bait = 1 cast)!", ephemeral=True)
+    async def next_cb(i):
+        if i.user.id != interaction.user.id:
+            await i.response.send_message("Not your shop!", ephemeral=True); return
+        state["page"] = (state["page"] + 1) % pages
+        sel.options = build_opts()
+        await i.response.edit_message(embed=build_embed(), view=v)
     btn = discord.ui.Button(label="Buy", style=discord.ButtonStyle.success)
     btn.callback = buy_cb
-    v.add_item(btn)
-    await interaction.response.send_message(embed=e, view=v)
-@client.tree.command(name="buyrod", description="Buy a rod from the daily fishshop")
+    nxt = discord.ui.Button(label="Next page", style=discord.ButtonStyle.primary)
+    nxt.callback = next_cb
+    v.add_item(btn); v.add_item(nxt)
+    await interaction.response.send_message(embed=build_embed(), view=v)
+@client.tree.command(name="buyrod", description="Buy a rod from the fishshop")
 @app_commands.describe(rod="rod name (any part, e.g. carbon)")
 @app_commands.guild_only()
 async def buyrod(interaction: discord.Interaction, rod: str):
     gid, uid = interaction.guild.id, interaction.user.id
-    day = int(time.time() // 86400)
-    r = random.Random(day)
-    rods = r.sample(FISH_RODS[1:], 3)
     pick = None
-    for rd in rods:
+    for rd in FISH_RODS:
         if rod.lower() in rd[1].lower() or rod.lower() == rd[0]:
             pick = rd
             break
     if not pick:
-        await interaction.response.send_message("That rod is not in today's shop! Check /fishshop.", ephemeral=True)
+        await interaction.response.send_message("That rod doesn't exist! Check /fishshop.", ephemeral=True)
         return
     if pick[0] in db.rod_list(gid, uid):
         await interaction.response.send_message("You already own that rod!", ephemeral=True)
@@ -4308,7 +4362,7 @@ async def buyrod(interaction: discord.Interaction, rod: str):
     db.conn.commit()
     db.set_flag(gid, uid, "fish_rod", pick[0])
     await interaction.response.send_message(f"You bought and equipped **{pick[1]}**!")
-@client.tree.command(name="buybait", description="Buy bait from the daily fishshop")
+@client.tree.command(name="buybait", description="Buy bait from the fishshop")
 @app_commands.describe(bait="bait name", amount="how many (default 1)")
 @app_commands.guild_only()
 async def buybait(interaction: discord.Interaction, bait: str, amount: int = 1):

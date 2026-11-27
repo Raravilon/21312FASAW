@@ -4293,14 +4293,16 @@ class QTEView(discord.ui.View):
         try: self.stop()
         except Exception: pass
         try:
+            # A final catch writes to SQLite, updates quests, and sends the
+            # public result. Acknowledge the button first so Discord does not
+            # expire the component interaction while that work is running.
+            if not interaction.response.is_done():
+                await interaction.response.defer()
             await finish_catch(interaction, self.member, self.roll, hit, self.msg)
         except Exception:
-            self.done = False  # let them retry if something blew up
             try:
-                if not interaction.response.is_done():
-                    await interaction.response.send_message("Oops, hook slipped! Press HOOK! again.", ephemeral=True)
-                else:
-                    await interaction.followup.send("Oops, hook slipped! Press HOOK! again.", ephemeral=True)
+                if interaction.response.is_done():
+                    await interaction.followup.send("Your catch was processed, but the fishing message could not be updated.", ephemeral=True)
             except Exception:
                 pass
 async def qte_loop(view):

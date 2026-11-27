@@ -4220,24 +4220,20 @@ class QTEView(discord.ui.View):
                 self.zstart = max(0, min(self.bar_len - self.zone, self.zstart + self.zone_shift))
             if self.boss_mode in ("star_eater", "abyssal_warden") and self.pulse % 10 == 0:
                 self.zone = 1 if self.zone == 2 else 2
-        cells = []
-        for i in range(self.bar_len):
-            if i == self.pos:
-                # cursor: green when inside the yellow zone, red otherwise
-                cells.append("🟩" if self.zstart <= i < self.zstart + self.zone else "🟥")
-            else:
-                cells.append("⬜" if self.zstart <= i < self.zstart + self.zone else "⬛")
-        return "".join(cells)
+        cells = ["⬜" if self.zstart <= i < self.zstart + self.zone else "⬛" for i in range(self.bar_len)]
+        # The pointer is on its own row, directly above the target cell.
+        pointer = "".join(" │ " if i == self.pos else "   " for i in range(self.bar_len)).rstrip()
+        return pointer + "\n" + "".join(cells)
     def make_embed(self):
         f = self.roll["fish"]
         if f is None:
             it = self.roll.get("item") or self.roll.get("trash")
             iname = ITEM_BY_KEY.get(it, ("", it or "?"))[1] if it else "junk"
-            e = discord.Embed(title="🎣 Something bites!", description=f"{self.bar()}\nPress **HOOK!** when the cursor is over the white zone!\nYou feel something heavy... maybe **{iname}**?\nWEATHER_EMOJI_PLACEHOLDER", colour=CREAM)
+            e = discord.Embed(title="🎣 Something bites!", description=f"```\n{self.bar()}\n```\nPress **HOOK!** when the pointer is above the white zone!\nYou feel something heavy... maybe **{iname}**?\nWEATHER_EMOJI_PLACEHOLDER", colour=CREAM)
             e.description = e.description.replace("WEATHER_EMOJI_PLACEHOLDER", f"{WEATHER_EMOJI[self.roll['weather']]} {self.roll['weather'].title()}")
             return e
         misses_left = min(self.hooks_done, self.max_misses) - self.misses
-        e = discord.Embed(title="🎣 Something bites!", description=f"{self.bar()}\nPress **HOOK!** when the cursor is over the white zone!\nHooks: **{self.hooks_done}/{self.hooks_required}** · Misses left: **{misses_left}**\nWEATHER_EMOJI_PLACEHOLDER", colour=CREAM)
+        e = discord.Embed(title="🎣 Something bites!", description=f"```\n{self.bar()}\n```\nPress **HOOK!** when the pointer is above the white zone!\nHooks: **{self.hooks_done}/{self.hooks_required}** · Misses left: **{misses_left}**\nWEATHER_EMOJI_PLACEHOLDER", colour=CREAM)
         e.description = e.description.replace("WEATHER_EMOJI_PLACEHOLDER", f"{WEATHER_EMOJI[self.roll['weather']]} {self.roll['weather'].title()}")
         return e
     async def interaction_check(self, interaction):

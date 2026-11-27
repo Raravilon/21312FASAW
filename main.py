@@ -4193,11 +4193,14 @@ class QTEView(discord.ui.View):
         self.hooks_done = 0
         self.misses = 0
         self.max_misses = 4
-        self.zstart = (self.bar_len - self.zone) // 2
+        self.pointer_pos = self.bar_len // 2
+        self.zstart = self.pointer_pos - self.zone // 2
+        self.zone_min = max(0, self.pointer_pos - 3 - self.zone // 2)
+        self.zone_max = min(self.bar_len - self.zone, self.pointer_pos + 3 - self.zone // 2)
         self.zone_shift = 0
         self.pulse = 0
         # faster cursor, faster for rarer fish
-        base = {"common": 0.8, "uncommon": 0.7, "rare": 0.6, "epic": 0.55, "legendary": 0.45}
+        base = {"common": 0.32, "uncommon": 0.30, "rare": 0.28, "epic": 0.26, "legendary": 0.24}
         b = base.get(rar, 0.7) if f else 0.7
         self.tick = max(0.15, b * (1 - min(50, max(-50, roll["res"])) / 100))
         # escape timer: fish swims away if you wait too long (bait is wasted).
@@ -4206,8 +4209,7 @@ class QTEView(discord.ui.View):
         self.escape_after = random.uniform(lo, hi)
         self.task = None
         self.interaction = None
-        self.pos = random.randrange(self.bar_len)
-        self.dir = random.choice((-1, 1))
+        self.zone_dir = random.choice((-1, 1))
         self.turns = 0
     def bar(self):
         if self.is_boss:
@@ -4217,12 +4219,13 @@ class QTEView(discord.ui.View):
             if self.pulse % (8 if self.boss_mode in ("kraken", "abyssal_warden") else 12) == 0:
                 self.zone_shift = -self.zone_shift if self.zone_shift else 1
             if self.boss_mode in ("tide_god", "world_serpent", "coral_colossus"):
-                self.zstart = max(0, min(self.bar_len - self.zone, self.zstart + self.zone_shift))
+                self.zone_min = max(0, self.pointer_pos - 4 - self.zone // 2)
+                self.zone_max = min(self.bar_len - self.zone, self.pointer_pos + 4 - self.zone // 2)
             if self.boss_mode in ("star_eater", "abyssal_warden") and self.pulse % 10 == 0:
                 self.zone = 1 if self.zone == 2 else 2
         cells = ["⬜" if self.zstart <= i < self.zstart + self.zone else "⬛" for i in range(self.bar_len)]
         # The pointer is on its own row, directly above the target cell.
-        pointer = "".join(" │ " if i == self.pos else "   " for i in range(self.bar_len)).rstrip()
+        pointer = "".join(" │ " if i == self.pointer_pos else "   " for i in range(self.bar_len)).rstrip()
         return pointer + "\n" + "".join(cells)
     def make_embed(self):
         f = self.roll["fish"]
@@ -4256,7 +4259,7 @@ class QTEView(discord.ui.View):
             except Exception:
                 pass
             return
-        hit = self.zstart <= self.pos < self.zstart + self.zone
+        hit = self.zstart <= self.pointer_pos < self.zstart + self.zone
         if self.is_boss and self.boss_mode in ("kraken", "dreadmaw") and random.random() < 0.12:
             hit = False
         if hit and self.hooks_done + 1 < self.hooks_required:
@@ -4264,8 +4267,8 @@ class QTEView(discord.ui.View):
             self.zone = max(2 if self.bar_len <= 15 else 3, self.zone - 1)
             self.zstart = min(self.zstart, self.bar_len - self.zone)
             self.turns += 1
-            if random.random() < 0.45:
-                self.dir *= -1
+            if random.random() < 0.35:
+                self.zone_dir *= -1
             button.label = f"HOOK! ({self.hooks_done}/{self.hooks_required})"
             try:
                 await interaction.response.edit_message(embed=self.make_embed(), view=self)
@@ -4275,8 +4278,8 @@ class QTEView(discord.ui.View):
         if not hit and self.misses < min(self.hooks_done, self.max_misses):
             self.misses += 1
             self.turns += 1
-            if random.random() < 0.55:
-                self.dir *= -1
+            if random.random() < 0.35:
+                self.zone_dir *= -1
             button.label = f"HOOK! ({self.hooks_done}/{self.hooks_required})"
             try:
                 await interaction.response.edit_message(content=f"Missed! You have {min(self.hooks_done, self.max_misses) - self.misses} miss(es) left.", embed=self.make_embed(), view=self)
@@ -4314,9 +4317,13 @@ async def qte_loop(view):
                 except Exception: pass
                 await escape_catch(view)
                 break
-            view.pos += view.dir
-            if view.pos >= view.bar_len - 1: view.pos = view.bar_len - 1; view.dir = -1
-            if view.pos <= 0: view.pos = 0; view.dir = 1
+            view.zstart += view.zone_dir
+            if view.zstart <= view.zone_min:
+                view.zstart = view.zone_min
+                view.zone_dir = 1
+            elif view.zstart >= view.zone_max:
+                view.zstart = view.zone_max
+                view.zone_dir = -1
             try: await view.msg.edit(embed=view.make_embed(), view=view)
             except Exception: break
     except asyncio.CancelledError: pass
